@@ -11,7 +11,10 @@ os.environ.setdefault("APPROVAL_SIGNING_KEY", "test-signing-key-32-bytes-minimum
 os.environ.setdefault("APPROVAL_ISSUER_TOKEN", "test-issuer-token")
 os.environ.setdefault("APPROVAL_DEFAULT_TTL_SECONDS", "60")
 os.environ.setdefault("APPROVAL_MAX_TTL_SECONDS", "300")
-os.environ.setdefault("TRUSTED_TOOL_CATALOG_PATH", str(ROOT / "config" / "trusted_tools.example.json"))
+os.environ.setdefault(
+    "TRUSTED_TOOL_CATALOG_PATH",
+    str(ROOT / "config" / "trusted_tools.example.json"),
+)
 os.environ.setdefault(
     "TRUSTED_TOOL_CATALOG_SHA256",
     (ROOT / "config" / "trusted_tools.example.sha256").read_text().strip(),
@@ -132,10 +135,7 @@ def test_real_mcp_request_does_not_leak_argument_value_to_telemetry(monkeypatch)
 
     telemetry_text = " ".join(
         [str(span.attributes) + str(span.events) for span in exporter.spans]
-        + [
-            str(instrument.measurements)
-            for instrument in meter.instruments.values()
-        ]
+        + [str(instrument.measurements) for instrument in meter.instruments.values()]
     )
     assert sentinel not in telemetry_text
 
