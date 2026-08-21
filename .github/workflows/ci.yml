@@ -1,0 +1,20 @@
+name: CI
+on:
+  push:
+  pull_request:
+permissions:
+  contents: read
+jobs:
+  test:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+      - run: pip install -e ".[dev]" ruff
+      - run: ruff check app tests scripts
+      - run: pytest -q
+      - run: python scripts/run_benchmark.py --fail-on-unsafe
+      - run: docker build -t mcp-agent-firewall:test .
