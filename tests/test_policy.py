@@ -7,7 +7,13 @@ ROOT = Path(__file__).resolve().parents[1]
 ENGINE = PolicyEngine(PolicyConfig.load(ROOT / "config" / "policy.example.yaml"))
 
 
-def req(tool: str, args: dict, *, method_header: str = "tools/call", name_header: str | None = None):
+def req(
+    tool: str,
+    args: dict,
+    *,
+    method_header: str = "tools/call",
+    name_header: str | None = None,
+):
     return EvaluationInput(
         protocol_version="2026-07-28",
         mcp_method=method_header,
