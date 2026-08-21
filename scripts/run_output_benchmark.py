@@ -42,7 +42,9 @@ def main() -> int:
         "malformed_json_blocked": malformed.signals == ("invalid_json_response",),
         "binary_blocked": binary.signals == ("uninspectable_binary",),
         "oversized_blocked": oversized.signals == ("response_too_large",),
-        "json_hidden_by_content_type_still_scanned": hidden_json_secret.action == OutputAction.BLOCK,
+        "json_hidden_by_content_type_still_scanned": (
+            hidden_json_secret.action == OutputAction.BLOCK
+        ),
         "secret_absent_from_public_metadata": secret not in str(structured_secret.public_data()),
     }
     failed = [case_id for case_id, ok in results.items() if not ok]
