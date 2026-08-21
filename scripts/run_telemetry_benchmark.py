@@ -25,7 +25,10 @@ def main() -> int:
         "passed": passed,
         "unsafe_false_accepts": len(cases) - passed,
         "details": [{"id": case_id, "ok": ok} for case_id, ok in cases],
-        "note": "Synthetic low-cardinality/privacy regression suite; not a production observability claim.",
+        "note": (
+            "Synthetic low-cardinality/privacy regression suite; "
+            "not a production observability claim."
+        ),
     }
     print(json.dumps(summary, indent=2))
     return 0 if passed == len(cases) else 1
