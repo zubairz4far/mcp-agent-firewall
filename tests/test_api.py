@@ -1,14 +1,19 @@
+import base64
 import os
 from pathlib import Path
 
+ROOT = Path(__file__).resolve().parents[1]
 os.environ.setdefault("AUDIT_DB_PATH", "/tmp/mcp-agent-firewall-test.db")
-os.environ.setdefault(
-    "POLICY_PATH", str(Path(__file__).resolve().parents[1] / "config" / "policy.example.yaml")
-)
+os.environ.setdefault("POLICY_PATH", str(ROOT / "config" / "policy.example.yaml"))
 os.environ.setdefault("APPROVAL_SIGNING_KEY", "test-signing-key-32-bytes-minimum!!")
 os.environ.setdefault("APPROVAL_ISSUER_TOKEN", "test-issuer-token")
 os.environ.setdefault("APPROVAL_DEFAULT_TTL_SECONDS", "60")
 os.environ.setdefault("APPROVAL_MAX_TTL_SECONDS", "300")
+os.environ.setdefault("TRUSTED_TOOL_CATALOG_PATH", str(ROOT / "config" / "trusted_tools.example.json"))
+os.environ.setdefault(
+    "TRUSTED_TOOL_CATALOG_SHA256",
+    (ROOT / "config" / "trusted_tools.example.sha256").read_text().strip(),
+)
 
 from fastapi.testclient import TestClient
 
@@ -62,6 +67,8 @@ def test_health():
     response = client.get("/health")
     assert response.status_code == 200
     assert response.json()["approval_mode"] == "signed_receipts"
+    assert response.json()["tool_catalog_version"] == "2026-08-21.v1"
+    assert len(response.json()["tool_catalog_sha256"]) == 64
 
 
 def test_denied_tool_returns_403():
@@ -130,6 +137,16 @@ def test_approval_issue_rejects_request_that_does_not_require_approval():
     assert response.status_code == 409
 
 
+def test_approval_issue_rejects_schema_invalid_request_before_signing():
+    response = client.post(
+        "/v1/approvals/issue",
+        headers={"X-Operator-Token": "test-issuer-token"},
+        json=approval_payload("delete_file", {}),
+    )
+    assert response.status_code == 400
+    assert response.json()["detail"]["catalog_error"] == "tool_arguments_schema_invalid"
+
+
 def test_signed_receipt_is_bound_to_exact_request():
     receipt = issue_receipt("delete_file", {"path": "/tmp/a"})
     h = headers("delete_file")
@@ -141,6 +158,107 @@ def test_signed_receipt_is_bound_to_exact_request():
     )
     assert response.status_code == 428
     assert response.json()["error"]["data"]["approval_error"] == "approval_request_mismatch"
+
+
+def test_policy_allow_pattern_cannot_bypass_trusted_catalog():
+    response = client.post(
+        "/mcp",
+        headers=headers("read_unpinned"),
+        json=body("read_unpinned", {}),
+    )
+    assert response.status_code == 403
+    assert response.json()["error"]["code"] == -32044
+
+
+def test_schema_invalid_arguments_fail_before_upstream():
+    response = client.post(
+        "/mcp",
+        headers=headers("search"),
+        json=body("search", {"q": "x", "unexpected": True}),
+    )
+    assert response.status_code == 400
+    assert response.json()["error"]["code"] == -32602
+
+
+def test_required_mcp_param_header_is_enforced():
+    response = client.post(
+        "/mcp",
+        headers=headers("read_metrics"),
+        json=body("read_metrics", {"region": "us-west1"}),
+    )
+    assert response.status_code == 400
+    assert response.json()["error"]["code"] == -32020
+    assert response.json()["error"]["data"]["catalog_error"] == "mcp_param_missing"
+
+
+def test_mcp_param_header_body_mismatch_is_rejected():
+    h = headers("read_metrics")
+    h["Mcp-Param-Region"] = "eu-west1"
+    response = client.post(
+        "/mcp",
+        headers=h,
+        json=body("read_metrics", {"region": "us-west1"}),
+    )
+    assert response.status_code == 400
+    assert response.json()["error"]["data"]["catalog_error"] == "mcp_param_body_mismatch"
+
+
+def test_mcp_param_base64_sentinel_matches_unicode_body_value():
+    h = headers("search")
+    encoded = base64.b64encode("東京".encode()).decode()
+    h["Mcp-Param-Region"] = f"=?base64?{encoded}?="
+    response = client.post(
+        "/mcp",
+        headers=h,
+        json=body("search", {"q": "x", "region": "東京"}),
+    )
+    assert response.status_code == 503
+
+
+def test_nested_mcp_param_binding_is_enforced():
+    h = headers("get_user")
+    h["Mcp-Param-Tenant"] = "acme"
+    response = client.post(
+        "/mcp",
+        headers=h,
+        json=body("get_user", {"id": "u1", "context": {"tenant": "acme"}}),
+    )
+    assert response.status_code == 503
+
+
+def test_valid_custom_header_is_forwarded_upstream(monkeypatch):
+    class FakeResponse:
+        status_code = 200
+        content = b'{"jsonrpc":"2.0","id":1,"result":{"ok":true}}'
+        headers = {"content-type": "application/json"}
+
+    class FakeAsyncClient:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc, tb):
+            return False
+
+        async def post(self, url, *, content, headers):
+            assert url == "https://upstream.example/mcp"
+            assert headers["Mcp-Name"] == "read_metrics"
+            assert headers["Mcp-Param-Region"] == "us-west1"
+            return FakeResponse()
+
+    monkeypatch.setattr(main_module, "UPSTREAM_MCP_URL", "https://upstream.example/mcp")
+    monkeypatch.setattr(main_module.httpx, "AsyncClient", FakeAsyncClient)
+
+    h = headers("read_metrics")
+    h["Mcp-Param-Region"] = "us-west1"
+    response = client.post(
+        "/mcp",
+        headers=h,
+        json=body("read_metrics", {"region": "us-west1", "window_minutes": 15}),
+    )
+    assert response.status_code == 200
 
 
 def test_valid_receipt_is_consumed_once_at_dispatch(monkeypatch):
