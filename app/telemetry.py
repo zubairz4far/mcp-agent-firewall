@@ -2,9 +2,10 @@ from __future__ import annotations
 
 import os
 import time
+from collections.abc import Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass
-from typing import Any, Iterator
+from typing import Any
 
 from opentelemetry import metrics, trace
 from opentelemetry.context import Context
@@ -17,7 +18,7 @@ from opentelemetry.sdk.metrics.export import PeriodicExportingMetricReader
 from opentelemetry.sdk.resources import Resource
 from opentelemetry.sdk.trace import TracerProvider
 from opentelemetry.sdk.trace.export import BatchSpanProcessor
-from opentelemetry.trace import Span, Status, StatusCode, Tracer
+from opentelemetry.trace import Span, Status, StatusCode
 
 SERVICE_NAME = "mcp-agent-firewall"
 INSTRUMENTATION_NAME = "mcp-agent-firewall.telemetry"
