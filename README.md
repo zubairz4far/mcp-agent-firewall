@@ -224,7 +224,29 @@ python scripts/run_output_benchmark.py
 docker build -t mcp-agent-firewall:test .
 ```
 
-CI treats the output-containment benchmark as an independent regression gate rather than relying only on the general test suite.
+## Verified v0.5 regression evidence
+
+Verified on GitHub Actions for the v0.5 implementation:
+
+- **74 pytest tests passed**
+- policy safety benchmark: **32/32 exact decisions**
+- policy safety benchmark: **0 unsafe false accepts, 0 false blocks**
+- signed approval security benchmark: **11/11 passed**
+- signed approval security benchmark: **0 unsafe false accepts**
+- trusted schema / MCP header benchmark: **12/12 passed**
+- trusted schema / MCP header benchmark: **0 unsafe false accepts, 0 false blocks**
+- observability privacy/propagation benchmark: **14/14 passed**
+- observability benchmark: **0 detected telemetry leaks**
+- output-containment benchmark: **11/11 passed**
+- output-containment benchmark: **0 unsafe false accepts**
+- Ruff: **passed**
+- Docker build: **passed**
+
+The output-containment benchmark covers clean pass-through, structured secret keys, PEM private keys, bearer credentials, GitHub-style credentials, prompt-injection signaling, malformed JSON, binary output, response-size limits, misleading content types, and non-echoing public inspection metadata.
+
+The observability benchmark exercises real FastAPI/MCP requests and checks W3C parent context, policy/schema/approval/output spans, bounded metric dimensions, generated upstream trace propagation, output untrusted labeling, and absence of an injected secret sentinel from captured telemetry.
+
+These are **synthetic regression tests**, not a claim of universal production security or complete credential/prompt-injection detection.
 
 See [`docs/THREAT_MODEL.md`](docs/THREAT_MODEL.md) for trust boundaries, controls, and residual risks.
 
