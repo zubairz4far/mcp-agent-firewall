@@ -236,7 +236,11 @@ def issue_approval(
                     span=schema_span,
                 )
                 schema_span.set_attribute("error.type", exc.code)
-                observability.record_approval(phase="issue", outcome="schema_rejected", span=issue_span)
+                observability.record_approval(
+                    phase="issue",
+                    outcome="schema_rejected",
+                    span=issue_span,
+                )
                 raise HTTPException(status_code=400, detail=exc.data()) from exc
             observability.record_schema(
                 check="arguments",
@@ -435,7 +439,9 @@ async def proxy_mcp(
                     "id": body.get("id"),
                     "error": {
                         "code": -32042,
-                        "message": "Policy allowed the call but no upstream MCP server is configured",
+                        "message": (
+                            "Policy allowed the call but no upstream MCP server is configured"
+                        ),
                         "data": result.model_dump(mode="json"),
                     },
                 },
