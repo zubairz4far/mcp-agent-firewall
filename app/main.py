@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import secrets
 from pathlib import Path
 from typing import Any
 
@@ -8,6 +9,13 @@ import httpx
 from fastapi import FastAPI, Header, HTTPException, Request
 from fastapi.responses import JSONResponse, Response
 
+from app.approval import (
+    ApprovalError,
+    ApprovalIssueRequest,
+    ApprovalIssueResponse,
+    ApprovalReceiptService,
+    response_from_issued,
+)
 from app.audit import AuditStore
 from app.models import Decision, EvaluationInput, McpEnvelope
 from app.policy import PolicyConfig, PolicyEngine
@@ -17,7 +25,10 @@ ROOT = Path(__file__).resolve().parents[1]
 POLICY_PATH = os.getenv("POLICY_PATH", str(ROOT / "config" / "policy.example.yaml"))
 AUDIT_DB_PATH = os.getenv("AUDIT_DB_PATH", str(ROOT / "data" / "audit.db"))
 UPSTREAM_MCP_URL = os.getenv("UPSTREAM_MCP_URL", "").strip()
-APPROVAL_TOKEN = os.getenv("APPROVAL_TOKEN", "")
+APPROVAL_SIGNING_KEY = os.getenv("APPROVAL_SIGNING_KEY", "")
+APPROVAL_ISSUER_TOKEN = os.getenv("APPROVAL_ISSUER_TOKEN", "")
+APPROVAL_DEFAULT_TTL_SECONDS = int(os.getenv("APPROVAL_DEFAULT_TTL_SECONDS", "300"))
+APPROVAL_MAX_TTL_SECONDS = int(os.getenv("APPROVAL_MAX_TTL_SECONDS", "900"))
 AUDIT_READ_TOKEN = os.getenv("AUDIT_READ_TOKEN", "")
 UPSTREAM_BEARER_TOKEN = os.getenv("UPSTREAM_BEARER_TOKEN", "")
 MAX_REQUESTS_PER_MINUTE = int(os.getenv("MAX_REQUESTS_PER_MINUTE", "120"))
@@ -27,8 +38,13 @@ policy = PolicyConfig.load(POLICY_PATH)
 engine = PolicyEngine(policy)
 audit = AuditStore(AUDIT_DB_PATH)
 rate_limiter = SlidingWindowRateLimiter(MAX_REQUESTS_PER_MINUTE)
+approval_receipts = ApprovalReceiptService(
+    APPROVAL_SIGNING_KEY,
+    default_ttl_seconds=APPROVAL_DEFAULT_TTL_SECONDS,
+    max_ttl_seconds=APPROVAL_MAX_TTL_SECONDS,
+)
 
-app = FastAPI(title="MCP Agent Firewall", version="0.1.0")
+app = FastAPI(title="MCP Agent Firewall", version="0.2.0")
 
 
 def _client_name(body: dict[str, Any]) -> str | None:
@@ -62,14 +78,70 @@ def _evaluation_input(
     )
 
 
+def _approval_error_response(
+    body: dict[str, Any],
+    result: Any,
+    approval_error: str,
+) -> JSONResponse:
+    data = result.model_dump(mode="json")
+    data["approval_error"] = approval_error
+    return JSONResponse(
+        status_code=428,
+        content={
+            "jsonrpc": "2.0",
+            "id": body.get("id"),
+            "error": {
+                "code": -32041,
+                "message": "Valid human approval receipt required",
+                "data": data,
+            },
+        },
+    )
+
+
 @app.get("/health")
 def health() -> dict[str, str]:
-    return {"status": "ok", "policy_version": policy.version}
+    return {
+        "status": "ok",
+        "policy_version": policy.version,
+        "approval_mode": "signed_receipts" if approval_receipts.configured else "disabled",
+    }
 
 
 @app.post("/v1/evaluate")
 def evaluate(payload: EvaluationInput) -> dict[str, Any]:
     return engine.evaluate(payload).model_dump(mode="json")
+
+
+@app.post("/v1/approvals/issue", response_model=ApprovalIssueResponse)
+def issue_approval(
+    payload: ApprovalIssueRequest,
+    operator_token: str | None = Header(default=None, alias="X-Operator-Token"),
+) -> ApprovalIssueResponse:
+    if (
+        not APPROVAL_ISSUER_TOKEN
+        or not operator_token
+        or not secrets.compare_digest(operator_token, APPROVAL_ISSUER_TOKEN)
+    ):
+        raise HTTPException(status_code=403, detail="approval_issuer_access_denied")
+
+    result = engine.evaluate(payload.request)
+    if result.decision != Decision.APPROVAL_REQUIRED:
+        raise HTTPException(status_code=409, detail="request_does_not_require_human_approval")
+
+    try:
+        receipt, claims = approval_receipts.issue(
+            payload.request,
+            policy_version=policy.version,
+            approver=payload.approver,
+            ttl_seconds=payload.ttl_seconds,
+        )
+    except ApprovalError as exc:
+        status_code = 503 if exc.code == "approval_signing_not_configured" else 400
+        raise HTTPException(status_code=status_code, detail=exc.code) from exc
+
+    audit.register_approval(claims)
+    return response_from_issued(receipt, claims)
 
 
 @app.get("/v1/audit")
@@ -134,21 +206,18 @@ async def proxy_mcp(
             },
         )
 
+    approval_claims = None
     if result.decision == Decision.APPROVAL_REQUIRED:
-        approved = bool(APPROVAL_TOKEN) and human_approval == APPROVAL_TOKEN
-        if not approved:
-            return JSONResponse(
-                status_code=428,
-                content={
-                    "jsonrpc": "2.0",
-                    "id": body.get("id"),
-                    "error": {
-                        "code": -32041,
-                        "message": "Human approval required",
-                        "data": result.model_dump(mode="json"),
-                    },
-                },
+        if not human_approval:
+            return _approval_error_response(body, result, "approval_receipt_required")
+        try:
+            approval_claims = approval_receipts.verify(
+                human_approval,
+                evaluation_input,
+                policy_version=policy.version,
             )
+        except ApprovalError as exc:
+            return _approval_error_response(body, result, exc.code)
 
     if not UPSTREAM_MCP_URL:
         return JSONResponse(
@@ -160,6 +229,19 @@ async def proxy_mcp(
                     "code": -32042,
                     "message": "Policy allowed the call but no upstream MCP server is configured",
                     "data": result.model_dump(mode="json"),
+                },
+            },
+        )
+
+    if approval_claims is not None and not audit.consume_approval(approval_claims):
+        return JSONResponse(
+            status_code=409,
+            content={
+                "jsonrpc": "2.0",
+                "id": body.get("id"),
+                "error": {
+                    "code": -32043,
+                    "message": "Approval receipt is unknown, expired, or already consumed",
                 },
             },
         )
