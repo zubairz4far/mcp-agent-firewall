@@ -35,9 +35,8 @@ _APPROVAL_OUTCOMES = frozenset(
         "rejected",
         "issued",
         "missing",
-        "verified",
+        "accepted",
         "consumed",
-        "replayed",
     }
 )
 
