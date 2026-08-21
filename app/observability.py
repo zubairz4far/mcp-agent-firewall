@@ -19,11 +19,42 @@ from opentelemetry.trace import Span, SpanKind, Tracer
 from opentelemetry.trace.propagation.tracecontext import TraceContextTextMapPropagator
 
 INSTRUMENTATION_SCOPE = "mcp-agent-firewall"
+MAX_TRACE_ATTRIBUTE_CHARS = 256
 _METHOD_FAMILIES = frozenset({"server", "tools", "resources", "prompts"})
+_POLICY_DECISIONS = frozenset({"allow", "deny", "approval_required"})
+_RISK_LEVELS = frozenset({"low", "medium", "high", "critical"})
+_SCHEMA_CHECKS = frozenset({"arguments", "headers"})
+_SCHEMA_OUTCOMES = frozenset({"accepted", "rejected"})
+_SCHEMA_PHASES = frozenset({"issue", "dispatch"})
+_APPROVAL_PHASES = frozenset({"issue", "verify", "consume"})
+_APPROVAL_OUTCOMES = frozenset(
+    {
+        "access_denied",
+        "not_required",
+        "schema_rejected",
+        "rejected",
+        "issued",
+        "missing",
+        "accepted",
+        "consumed",
+    }
+)
 
 
 def _truthy(value: str) -> bool:
     return value.strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _bounded_label(value: str, allowed: frozenset[str]) -> str:
+    return value if value in allowed else "other"
+
+
+def trace_attribute(value: str | None) -> str:
+    """Bound caller/config-derived trace strings without echoing control characters."""
+    if not value:
+        return ""
+    sanitized = "".join(char if 0x20 <= ord(char) <= 0x7E else "?" for char in str(value))
+    return sanitized[:MAX_TRACE_ATTRIBUTE_CHARS]
 
 
 def method_family(method: str) -> str:
@@ -81,6 +112,7 @@ class FirewallObservability:
         return self.mode == "otlp_http"
 
     def extract_parent(self, headers: Mapping[str, str]) -> Context:
+        # W3C TraceContext only. Caller baggage is intentionally ignored.
         return TraceContextTextMapPropagator().extract(carrier=headers)
 
     def trace_context_headers(self) -> dict[str, str]:
@@ -102,15 +134,15 @@ class FirewallObservability:
     ) -> Iterator[Span]:
         parent = self.extract_parent(headers)
         attributes: dict[str, Any] = {
-            "mcp.method": method,
+            "mcp.method": trace_attribute(method),
             "mcp.method_family": method_family(method),
-            "mcp.protocol.version": protocol_version,
-            "mcp.request.sha256": request_sha256,
-            "firewall.policy.version": policy_version,
-            "firewall.catalog.version": catalog_version,
+            "mcp.protocol.version": trace_attribute(protocol_version),
+            "mcp.request.sha256": request_sha256[:64],
+            "firewall.policy.version": trace_attribute(policy_version),
+            "firewall.catalog.version": trace_attribute(catalog_version),
         }
         if tool_name:
-            attributes["mcp.tool.name"] = tool_name
+            attributes["mcp.tool.name"] = trace_attribute(tool_name)
         with self.tracer.start_as_current_span(
             "mcp.firewall.request",
             context=parent,
@@ -127,10 +159,16 @@ class FirewallObservability:
         attributes: Mapping[str, Any] | None = None,
         kind: SpanKind = SpanKind.INTERNAL,
     ) -> Iterator[Span]:
+        safe_attributes = {
+            str(key)[:MAX_TRACE_ATTRIBUTE_CHARS]: (
+                trace_attribute(value) if isinstance(value, str) else value
+            )
+            for key, value in (attributes or {}).items()
+        }
         with self.tracer.start_as_current_span(
             name,
             kind=kind,
-            attributes=dict(attributes or {}),
+            attributes=safe_attributes,
         ) as span:
             yield span
 
@@ -142,15 +180,17 @@ class FirewallObservability:
         method: str,
         span: Span | None = None,
     ) -> None:
+        safe_decision = _bounded_label(decision, _POLICY_DECISIONS)
+        safe_risk = _bounded_label(risk, _RISK_LEVELS)
         attributes = {
-            "decision": decision,
-            "risk": risk,
+            "decision": safe_decision,
+            "risk": safe_risk,
             "method_family": method_family(method),
         }
         self.policy_decisions.add(1, attributes)
         target = span or trace.get_current_span()
-        target.set_attribute("firewall.decision", decision)
-        target.set_attribute("firewall.risk", risk)
+        target.set_attribute("firewall.decision", safe_decision)
+        target.set_attribute("firewall.risk", safe_risk)
 
     def record_schema(
         self,
@@ -160,20 +200,25 @@ class FirewallObservability:
         phase: str,
         span: Span | None = None,
     ) -> None:
+        safe_check = _bounded_label(check, _SCHEMA_CHECKS)
+        safe_outcome = _bounded_label(outcome, _SCHEMA_OUTCOMES)
+        safe_phase = _bounded_label(phase, _SCHEMA_PHASES)
         self.schema_validations.add(
             1,
-            {"check": check, "outcome": outcome, "phase": phase},
+            {"check": safe_check, "outcome": safe_outcome, "phase": safe_phase},
         )
         target = span or trace.get_current_span()
-        target.set_attribute("firewall.schema.check", check)
-        target.set_attribute("firewall.schema.outcome", outcome)
-        target.set_attribute("firewall.schema.phase", phase)
+        target.set_attribute("firewall.schema.check", safe_check)
+        target.set_attribute("firewall.schema.outcome", safe_outcome)
+        target.set_attribute("firewall.schema.phase", safe_phase)
 
     def record_approval(self, *, phase: str, outcome: str, span: Span | None = None) -> None:
-        self.approval_events.add(1, {"phase": phase, "outcome": outcome})
+        safe_phase = _bounded_label(phase, _APPROVAL_PHASES)
+        safe_outcome = _bounded_label(outcome, _APPROVAL_OUTCOMES)
+        self.approval_events.add(1, {"phase": safe_phase, "outcome": safe_outcome})
         target = span or trace.get_current_span()
-        target.set_attribute("firewall.approval.phase", phase)
-        target.set_attribute("firewall.approval.outcome", outcome)
+        target.set_attribute("firewall.approval.phase", safe_phase)
+        target.set_attribute("firewall.approval.outcome", safe_outcome)
 
     def record_upstream(
         self,
@@ -197,8 +242,10 @@ def configure_observability(*, service_version: str) -> FirewallObservability:
     if requested and endpoint:
         resource = Resource.create(
             {
-                "service.name": os.getenv("OTEL_SERVICE_NAME", "mcp-agent-firewall"),
-                "service.version": service_version,
+                "service.name": trace_attribute(
+                    os.getenv("OTEL_SERVICE_NAME", "mcp-agent-firewall")
+                ),
+                "service.version": trace_attribute(service_version),
             }
         )
 

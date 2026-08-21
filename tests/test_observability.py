@@ -31,9 +31,11 @@ from opentelemetry.trace import SpanKind  # noqa: E402
 
 from app import main as main_module  # noqa: E402
 from app.observability import (  # noqa: E402
+    MAX_TRACE_ATTRIBUTE_CHARS,
     FirewallObservability,
     method_family,
     status_family,
+    trace_attribute,
 )
 
 
@@ -111,6 +113,14 @@ def test_method_and_status_dimensions_are_bounded():
     assert status_family(799) == "other"
 
 
+def test_trace_attribute_is_ascii_sanitized_and_length_bounded():
+    value = "private\nvalue-" + "x" * 1000 + "東京"
+    bounded = trace_attribute(value)
+    assert len(bounded) == MAX_TRACE_ATTRIBUTE_CHARS
+    assert "\n" not in bounded
+    assert all(0x20 <= ord(char) <= 0x7E for char in bounded)
+
+
 def test_real_mcp_request_does_not_leak_argument_value_to_telemetry(monkeypatch):
     observability, exporter, meter = build_observability()
     monkeypatch.setattr(main_module, "observability", observability)
@@ -145,6 +155,33 @@ def test_real_mcp_request_does_not_leak_argument_value_to_telemetry(monkeypatch)
     assert root.parent.span_id == int("00f067aa0ba902b7", 16)
 
 
+def test_request_trace_attributes_bound_attacker_controlled_method_and_tool():
+    observability, exporter, _ = build_observability()
+    hostile_method = "attacker/" + "m" * 1000
+    hostile_tool = "read_" + "t" * 1000
+    with observability.request_span(
+        headers={},
+        method=hostile_method,
+        protocol_version="2026-07-28\nsecret",
+        tool_name=hostile_tool,
+        request_sha256="a" * 64,
+        policy_version="p" * 1000,
+        catalog_version="c" * 1000,
+    ):
+        pass
+
+    span = next(item for item in exporter.spans if item.name == "mcp.firewall.request")
+    for key in (
+        "mcp.method",
+        "mcp.protocol.version",
+        "mcp.tool.name",
+        "firewall.policy.version",
+        "firewall.catalog.version",
+    ):
+        assert len(span.attributes[key]) <= MAX_TRACE_ATTRIBUTE_CHARS
+        assert "\n" not in span.attributes[key]
+
+
 def test_metric_dimensions_never_include_tool_name_or_request_hash(monkeypatch):
     observability, _, meter = build_observability()
     monkeypatch.setattr(main_module, "observability", observability)
@@ -165,6 +202,24 @@ def test_metric_dimensions_never_include_tool_name_or_request_hash(monkeypatch):
             assert set(attributes) <= allowed_dimensions[name]
             assert "tool_name" not in attributes
             assert "request_sha256" not in attributes
+
+
+def test_metric_values_fail_closed_to_bounded_other_bucket():
+    observability, _, meter = build_observability()
+    secret = "customer-secret-" + "x" * 1000
+
+    observability.record_policy(decision=secret, risk=secret, method=secret)
+    observability.record_schema(check=secret, outcome=secret, phase=secret)
+    observability.record_approval(phase=secret, outcome=secret)
+
+    policy_attrs = meter.instruments["mcp.firewall.policy.decisions"].measurements[-1][1]
+    schema_attrs = meter.instruments["mcp.firewall.schema.validations"].measurements[-1][1]
+    approval_attrs = meter.instruments["mcp.firewall.approval.events"].measurements[-1][1]
+
+    assert policy_attrs == {"decision": "other", "risk": "other", "method_family": "other"}
+    assert schema_attrs == {"check": "other", "outcome": "other", "phase": "other"}
+    assert approval_attrs == {"phase": "other", "outcome": "other"}
+    assert secret not in str((policy_attrs, schema_attrs, approval_attrs))
 
 
 def test_missing_approval_emits_bounded_approval_event(monkeypatch):
