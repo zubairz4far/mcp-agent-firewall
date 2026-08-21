@@ -134,7 +134,14 @@ class FirewallObservability:
         ) as span:
             yield span
 
-    def record_policy(self, *, decision: str, risk: str, method: str, span: Span | None = None) -> None:
+    def record_policy(
+        self,
+        *,
+        decision: str,
+        risk: str,
+        method: str,
+        span: Span | None = None,
+    ) -> None:
         attributes = {
             "decision": decision,
             "risk": risk,
@@ -168,7 +175,13 @@ class FirewallObservability:
         target.set_attribute("firewall.approval.phase", phase)
         target.set_attribute("firewall.approval.outcome", outcome)
 
-    def record_upstream(self, *, status_code: int | None, duration_seconds: float, span: Span) -> None:
+    def record_upstream(
+        self,
+        *,
+        status_code: int | None,
+        duration_seconds: float,
+        span: Span,
+    ) -> None:
         outcome = status_family(status_code) if status_code is not None else "error"
         self.upstream_duration.record(max(0.0, duration_seconds), {"outcome": outcome})
         span.set_attribute("firewall.upstream.outcome", outcome)
