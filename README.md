@@ -149,14 +149,17 @@ The receipt is atomically consumed immediately before the upstream request. If t
 
 The original policy benchmark contains **32 synthetic cases** spanning protocol mismatches, denied tools, approval-required tools, protected paths, secret-bearing fields, argument limits, injection-risk signals, and known-safe reads.
 
-The v0.1 baseline was:
+Verified v0.2 CI results:
 
-- **32/32 exact policy decisions**
-- **0 unsafe false accepts**
-- **0 false blocks**
-- **15 unit/API tests passed**
+- **26 pytest tests passed**
+- policy safety benchmark: **32/32 exact decisions**
+- policy safety benchmark: **0 unsafe false accepts, 0 false blocks**
+- approval receipt security benchmark: **11/11 passed**
+- approval receipt security benchmark: **0 unsafe false accepts**
+- Ruff: **passed**
+- Docker build: **passed**
 
-v0.2 adds a dedicated approval-security benchmark covering signature tampering, request mutation, expiry, policy drift, wrong signing keys, malformed receipts, unregistered receipts, and replay attempts. CI gates both suites before merge.
+The approval benchmark covers signature tampering, request mutation, expiry, policy drift, wrong signing keys, malformed receipts, unregistered receipts, and replay attempts.
 
 These are synthetic regression results, not a claim of universal production security.
 
