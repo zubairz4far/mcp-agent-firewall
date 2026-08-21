@@ -20,6 +20,11 @@ from app.audit import AuditStore
 from app.models import Decision, EvaluationInput, McpEnvelope
 from app.policy import PolicyConfig, PolicyEngine
 from app.rate_limit import SlidingWindowRateLimiter
+from app.tool_catalog import (
+    ToolCatalogError,
+    TrustedToolCatalog,
+    decode_mcp_header_value,
+)
 
 ROOT = Path(__file__).resolve().parents[1]
 POLICY_PATH = os.getenv("POLICY_PATH", str(ROOT / "config" / "policy.example.yaml"))
@@ -34,6 +39,17 @@ UPSTREAM_BEARER_TOKEN = os.getenv("UPSTREAM_BEARER_TOKEN", "")
 MAX_REQUESTS_PER_MINUTE = int(os.getenv("MAX_REQUESTS_PER_MINUTE", "120"))
 MAX_BODY_BYTES = int(os.getenv("MAX_BODY_BYTES", "65536"))
 
+DEFAULT_CATALOG_PATH = ROOT / "config" / "trusted_tools.example.json"
+DEFAULT_CATALOG_PIN_PATH = ROOT / "config" / "trusted_tools.example.sha256"
+TRUSTED_TOOL_CATALOG_PATH = os.getenv("TRUSTED_TOOL_CATALOG_PATH", str(DEFAULT_CATALOG_PATH))
+configured_catalog_pin = os.getenv("TRUSTED_TOOL_CATALOG_SHA256", "").strip()
+if configured_catalog_pin:
+    TRUSTED_TOOL_CATALOG_SHA256 = configured_catalog_pin
+elif Path(TRUSTED_TOOL_CATALOG_PATH).resolve() == DEFAULT_CATALOG_PATH.resolve():
+    TRUSTED_TOOL_CATALOG_SHA256 = DEFAULT_CATALOG_PIN_PATH.read_text(encoding="utf-8").strip()
+else:
+    TRUSTED_TOOL_CATALOG_SHA256 = ""
+
 policy = PolicyConfig.load(POLICY_PATH)
 engine = PolicyEngine(policy)
 audit = AuditStore(AUDIT_DB_PATH)
@@ -43,8 +59,14 @@ approval_receipts = ApprovalReceiptService(
     default_ttl_seconds=APPROVAL_DEFAULT_TTL_SECONDS,
     max_ttl_seconds=APPROVAL_MAX_TTL_SECONDS,
 )
+tool_catalog = TrustedToolCatalog.load(
+    TRUSTED_TOOL_CATALOG_PATH,
+    expected_sha256=TRUSTED_TOOL_CATALOG_SHA256,
+)
+if tool_catalog.protocol_version != policy.protocol_version:
+    raise RuntimeError("trusted tool catalog protocol version does not match policy")
 
-app = FastAPI(title="MCP Agent Firewall", version="0.2.0")
+app = FastAPI(title="MCP Agent Firewall", version="0.3.0")
 
 
 def _client_name(body: dict[str, Any]) -> str | None:
@@ -78,6 +100,18 @@ def _evaluation_input(
     )
 
 
+def _tool_name_and_arguments(payload: EvaluationInput) -> tuple[str, dict[str, Any]]:
+    if payload.body.method != "tools/call":
+        raise ToolCatalogError("tool_contract_not_applicable")
+    name = payload.body.params.get("name")
+    arguments = payload.body.params.get("arguments", {})
+    if not isinstance(name, str) or not name:
+        raise ToolCatalogError("tool_name_missing")
+    if not isinstance(arguments, dict):
+        raise ToolCatalogError("tool_arguments_must_be_object")
+    return name, arguments
+
+
 def _approval_error_response(
     body: dict[str, Any],
     result: Any,
@@ -99,12 +133,42 @@ def _approval_error_response(
     )
 
 
+def _catalog_error_response(body: dict[str, Any], error: ToolCatalogError) -> JSONResponse:
+    data = error.data()
+    if error.code == "tool_not_in_trusted_catalog":
+        status_code = 403
+        code = -32044
+        message = "Tool is not present in the pinned trusted catalog"
+    elif error.code.startswith("mcp_param_") or error.code.startswith("mcp_header_"):
+        status_code = 400
+        code = -32020
+        message = "MCP parameter header mismatch"
+    elif error.code in {"trusted_schema_runtime_error", "trusted_catalog_pin_mismatch"}:
+        status_code = 503
+        code = -32045
+        message = "Trusted tool catalog validation unavailable"
+    else:
+        status_code = 400
+        code = -32602
+        message = "Tool arguments do not satisfy the pinned trusted schema"
+    return JSONResponse(
+        status_code=status_code,
+        content={
+            "jsonrpc": "2.0",
+            "id": body.get("id"),
+            "error": {"code": code, "message": message, "data": data},
+        },
+    )
+
+
 @app.get("/health")
 def health() -> dict[str, str]:
     return {
         "status": "ok",
         "policy_version": policy.version,
         "approval_mode": "signed_receipts" if approval_receipts.configured else "disabled",
+        "tool_catalog_version": tool_catalog.catalog_version,
+        "tool_catalog_sha256": tool_catalog.digest,
     }
 
 
@@ -128,6 +192,12 @@ def issue_approval(
     result = engine.evaluate(payload.request)
     if result.decision != Decision.APPROVAL_REQUIRED:
         raise HTTPException(status_code=409, detail="request_does_not_require_human_approval")
+
+    try:
+        tool_name, arguments = _tool_name_and_arguments(payload.request)
+        tool_catalog.validate_arguments(tool_name, arguments)
+    except ToolCatalogError as exc:
+        raise HTTPException(status_code=400, detail=exc.data()) from exc
 
     try:
         receipt, claims = approval_receipts.issue(
@@ -178,11 +248,16 @@ async def proxy_mcp(
         raise HTTPException(status_code=400, detail="json_rpc_body_must_be_object")
 
     try:
+        decoded_mcp_name = decode_mcp_header_value(mcp_name) if mcp_name is not None else None
+    except ToolCatalogError as exc:
+        return _catalog_error_response(body, exc)
+
+    try:
         evaluation_input = _evaluation_input(
             body,
             protocol_version=mcp_protocol_version,
             mcp_method=mcp_method,
-            mcp_name=mcp_name,
+            mcp_name=decoded_mcp_name,
         )
     except Exception as exc:
         raise HTTPException(status_code=400, detail="invalid_mcp_envelope") from exc
@@ -205,6 +280,19 @@ async def proxy_mcp(
                 },
             },
         )
+
+    custom_mcp_headers: list[tuple[str, str]] = []
+    if evaluation_input.body.method == "tools/call":
+        try:
+            tool_name, arguments = _tool_name_and_arguments(evaluation_input)
+            tool_catalog.validate_arguments(tool_name, arguments)
+            custom_mcp_headers = tool_catalog.validate_mcp_param_headers(
+                tool_name,
+                arguments,
+                request.headers.raw,
+            )
+        except ToolCatalogError as exc:
+            return _catalog_error_response(body, exc)
 
     approval_claims = None
     if result.decision == Decision.APPROVAL_REQUIRED:
@@ -246,15 +334,17 @@ async def proxy_mcp(
             },
         )
 
-    forward_headers = {
-        "MCP-Protocol-Version": mcp_protocol_version,
-        "Mcp-Method": mcp_method,
-        "content-type": "application/json",
-    }
+    forward_header_items = [
+        ("MCP-Protocol-Version", mcp_protocol_version),
+        ("Mcp-Method", mcp_method),
+        ("content-type", "application/json"),
+    ]
     if mcp_name:
-        forward_headers["Mcp-Name"] = mcp_name
+        forward_header_items.append(("Mcp-Name", mcp_name))
+    forward_header_items.extend(custom_mcp_headers)
     if UPSTREAM_BEARER_TOKEN:
-        forward_headers["authorization"] = f"Bearer {UPSTREAM_BEARER_TOKEN}"
+        forward_header_items.append(("authorization", f"Bearer {UPSTREAM_BEARER_TOKEN}"))
+    forward_headers = httpx.Headers(forward_header_items)
 
     async with httpx.AsyncClient(timeout=30.0, follow_redirects=False) as client:
         upstream = await client.post(UPSTREAM_MCP_URL, content=raw, headers=forward_headers)
