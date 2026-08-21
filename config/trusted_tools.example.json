@@ -1,0 +1,160 @@
+{
+  "catalog_version": "2026-08-21.v1",
+  "protocol_version": "2026-07-28",
+  "tools": [
+    {
+      "name": "search",
+      "inputSchema": {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "type": "object",
+        "properties": {
+          "q": {"type": "string", "maxLength": 5000},
+          "text": {"type": "string", "maxLength": 5000},
+          "region": {"type": "string", "x-mcp-header": "Region"},
+          "query": {"type": "object", "additionalProperties": true}
+        },
+        "additionalProperties": false
+      }
+    },
+    {
+      "name": "read_document",
+      "inputSchema": {
+        "type": "object",
+        "properties": {"id": {"type": "string"}},
+        "required": ["id"],
+        "additionalProperties": false
+      }
+    },
+    {
+      "name": "read_file",
+      "inputSchema": {
+        "type": "object",
+        "properties": {"path": {"type": "string"}},
+        "required": ["path"],
+        "additionalProperties": false
+      }
+    },
+    {
+      "name": "get_user",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "id": {"type": "string"},
+          "context": {
+            "type": "object",
+            "properties": {
+              "tenant": {"type": "string", "x-mcp-header": "Tenant"}
+            },
+            "additionalProperties": false
+          }
+        },
+        "required": ["id"],
+        "additionalProperties": false
+      }
+    },
+    {
+      "name": "inspect_schema",
+      "inputSchema": {
+        "type": "object",
+        "properties": {"description": {"type": "string", "maxLength": 5000}},
+        "required": ["description"],
+        "additionalProperties": false
+      }
+    },
+    {
+      "name": "read_metrics",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "region": {"type": "string", "x-mcp-header": "Region"},
+          "window_minutes": {"type": "integer", "minimum": 1, "maximum": 1440}
+        },
+        "required": ["region"],
+        "additionalProperties": false
+      }
+    },
+    {
+      "name": "send_email",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "to": {"type": "string"},
+          "body": {"type": "string", "maxLength": 5000}
+        },
+        "required": ["to"],
+        "additionalProperties": false
+      }
+    },
+    {
+      "name": "delete_file",
+      "inputSchema": {
+        "type": "object",
+        "properties": {"path": {"type": "string"}},
+        "required": ["path"],
+        "additionalProperties": false
+      }
+    },
+    {
+      "name": "transfer_money",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "amount": {"type": "integer", "minimum": 1},
+          "currency": {
+            "type": "string",
+            "minLength": 3,
+            "maxLength": 3,
+            "x-mcp-header": "Currency"
+          }
+        },
+        "required": ["amount"],
+        "additionalProperties": false
+      }
+    },
+    {
+      "name": "update_record",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "id": {"type": "string"},
+          "name": {"type": "string"}
+        },
+        "required": ["id"],
+        "additionalProperties": false
+      }
+    },
+    {
+      "name": "create_issue",
+      "inputSchema": {
+        "type": "object",
+        "properties": {"title": {"type": "string", "minLength": 1, "maxLength": 500}},
+        "required": ["title"],
+        "additionalProperties": false
+      }
+    },
+    {
+      "name": "deploy_service",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "service": {"type": "string", "x-mcp-header": "Service"},
+          "environment": {"type": "string", "enum": ["staging", "production"]}
+        },
+        "required": ["service"],
+        "additionalProperties": false
+      }
+    },
+    {
+      "name": "purchase_item",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "sku": {"type": "string", "x-mcp-header": "Sku"},
+          "amount": {"type": "integer", "minimum": 1}
+        },
+        "required": ["sku", "amount"],
+        "additionalProperties": false
+      }
+    }
+  ]
+}
