@@ -65,10 +65,10 @@ class FirewallObservability:
             unit="{validation}",
             description="Pinned trusted-schema and MCP header validation outcomes",
         )
-        self.approval_verifications = meter.create_counter(
-            "mcp.firewall.approval.verifications",
-            unit="{verification}",
-            description="Signed human approval verification outcomes",
+        self.approval_events = meter.create_counter(
+            "mcp.firewall.approval.events",
+            unit="{event}",
+            description="Signed human approval lifecycle outcomes",
         )
         self.upstream_duration = meter.create_histogram(
             "mcp.firewall.upstream.duration",
@@ -115,10 +115,16 @@ class FirewallObservability:
             yield span
 
     @contextmanager
-    def stage(self, name: str, *, attributes: Mapping[str, Any] | None = None) -> Iterator[Span]:
+    def stage(
+        self,
+        name: str,
+        *,
+        attributes: Mapping[str, Any] | None = None,
+        kind: SpanKind = SpanKind.INTERNAL,
+    ) -> Iterator[Span]:
         with self.tracer.start_as_current_span(
             name,
-            kind=SpanKind.INTERNAL,
+            kind=kind,
             attributes=dict(attributes or {}),
         ) as span:
             yield span
@@ -134,15 +140,27 @@ class FirewallObservability:
         target.set_attribute("firewall.decision", decision)
         target.set_attribute("firewall.risk", risk)
 
-    def record_schema(self, *, check: str, outcome: str, span: Span | None = None) -> None:
-        self.schema_validations.add(1, {"check": check, "outcome": outcome})
+    def record_schema(
+        self,
+        *,
+        check: str,
+        outcome: str,
+        phase: str,
+        span: Span | None = None,
+    ) -> None:
+        self.schema_validations.add(
+            1,
+            {"check": check, "outcome": outcome, "phase": phase},
+        )
         target = span or trace.get_current_span()
         target.set_attribute("firewall.schema.check", check)
         target.set_attribute("firewall.schema.outcome", outcome)
+        target.set_attribute("firewall.schema.phase", phase)
 
-    def record_approval(self, *, outcome: str, span: Span | None = None) -> None:
-        self.approval_verifications.add(1, {"outcome": outcome})
+    def record_approval(self, *, phase: str, outcome: str, span: Span | None = None) -> None:
+        self.approval_events.add(1, {"phase": phase, "outcome": outcome})
         target = span or trace.get_current_span()
+        target.set_attribute("firewall.approval.phase", phase)
         target.set_attribute("firewall.approval.outcome", outcome)
 
     def record_upstream(self, *, status_code: int | None, duration_seconds: float, span: Span) -> None:
