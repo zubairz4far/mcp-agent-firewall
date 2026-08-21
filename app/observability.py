@@ -39,6 +39,19 @@ _APPROVAL_OUTCOMES = frozenset(
         "consumed",
     }
 )
+_OUTPUT_OUTCOMES = frozenset({"clean", "flagged", "blocked"})
+_OUTPUT_SIGNAL_CLASSES = frozenset(
+    {
+        "none",
+        "prompt_injection",
+        "credential",
+        "malformed",
+        "size_limit",
+        "inspection_limit",
+        "binary",
+        "multiple",
+    }
+)
 
 
 def _truthy(value: str) -> bool:
@@ -74,6 +87,38 @@ def status_family(status_code: int) -> str:
     return "other"
 
 
+def output_signal_class(signals: tuple[str, ...]) -> str:
+    if not signals:
+        return "none"
+    classes: set[str] = set()
+    for signal in signals:
+        if signal == "prompt_injection_signal":
+            classes.add("prompt_injection")
+        elif signal in {
+            "sensitive_key",
+            "private_key",
+            "bearer_credential",
+            "aws_access_key",
+            "github_token",
+            "openai_style_key",
+            "jwt_credential",
+        }:
+            classes.add("credential")
+        elif signal == "invalid_json_response":
+            classes.add("malformed")
+        elif signal == "response_too_large":
+            classes.add("size_limit")
+        elif signal == "inspection_limit_exceeded":
+            classes.add("inspection_limit")
+        elif signal == "uninspectable_binary":
+            classes.add("binary")
+        else:
+            classes.add("multiple")
+    if len(classes) != 1:
+        return "multiple"
+    return next(iter(classes))
+
+
 class FirewallObservability:
     """Manual, privacy-minimized telemetry for the firewall control plane.
 
@@ -100,6 +145,11 @@ class FirewallObservability:
             "mcp.firewall.approval.events",
             unit="{event}",
             description="Signed human approval lifecycle outcomes",
+        )
+        self.output_inspections = meter.create_counter(
+            "mcp.firewall.output.inspections",
+            unit="{inspection}",
+            description="Response-side containment outcomes",
         )
         self.upstream_duration = meter.create_histogram(
             "mcp.firewall.upstream.duration",
@@ -219,6 +269,24 @@ class FirewallObservability:
         target = span or trace.get_current_span()
         target.set_attribute("firewall.approval.phase", safe_phase)
         target.set_attribute("firewall.approval.outcome", safe_outcome)
+
+    def record_output(
+        self,
+        *,
+        outcome: str,
+        signals: tuple[str, ...],
+        span: Span | None = None,
+    ) -> None:
+        safe_outcome = _bounded_label(outcome, _OUTPUT_OUTCOMES)
+        signal_class = _bounded_label(output_signal_class(signals), _OUTPUT_SIGNAL_CLASSES)
+        self.output_inspections.add(
+            1,
+            {"outcome": safe_outcome, "signal_class": signal_class},
+        )
+        target = span or trace.get_current_span()
+        target.set_attribute("firewall.output.outcome", safe_outcome)
+        target.set_attribute("firewall.output.signal_class", signal_class)
+        target.set_attribute("firewall.output.signal_count", len(signals))
 
     def record_upstream(
         self,

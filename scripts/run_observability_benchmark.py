@@ -178,6 +178,7 @@ def main() -> int:
             "mcp.firewall.policy.decisions": {"decision", "risk", "method_family"},
             "mcp.firewall.schema.validations": {"check", "outcome", "phase"},
             "mcp.firewall.approval.events": {"phase", "outcome"},
+            "mcp.firewall.output.inspections": {"outcome", "signal_class"},
             "mcp.firewall.upstream.duration": {"outcome"},
         }
         dimensions_bounded = True
@@ -191,6 +192,7 @@ def main() -> int:
             None,
         )
         upstream_metric = meter.instruments["mcp.firewall.upstream.duration"].measurements
+        output_metric = meter.instruments["mcp.firewall.output.inspections"].measurements
 
         approval_stage_ok = (
             approval_response.status_code == 428 and "mcp.approval.verify" in span_names
@@ -207,6 +209,11 @@ def main() -> int:
             ("metric_dimensions_bounded", dimensions_bounded),
             ("upstream_request_succeeds", upstream_response.status_code == 200),
             ("upstream_span_is_client", upstream_span_ok),
+            ("output_inspection_stage_emitted", "mcp.output.inspect" in span_names),
+            (
+                "output_marked_untrusted",
+                upstream_response.headers.get("Mcp-Firewall-Untrusted-Content") == "true",
+            ),
             (
                 "upstream_trace_context_injected",
                 captured_upstream_headers.get("traceparent", "").startswith(
@@ -217,11 +224,18 @@ def main() -> int:
                 "upstream_2xx_metric_emitted",
                 any(attrs == {"outcome": "2xx"} for _, attrs in upstream_metric),
             ),
+            (
+                "clean_output_metric_emitted",
+                any(
+                    attrs == {"outcome": "clean", "signal_class": "none"}
+                    for _, attrs in output_metric
+                ),
+            ),
         ]
 
         failed = [case_id for case_id, ok in cases if not ok]
         summary = {
-            "suite": "observability_privacy_v1",
+            "suite": "observability_privacy_v2",
             "cases": len(cases),
             "passed": len(cases) - len(failed),
             "exact_security_decision_accuracy": (len(cases) - len(failed)) / len(cases),

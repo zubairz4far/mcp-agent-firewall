@@ -20,4 +20,5 @@ jobs:
       - run: python scripts/run_approval_benchmark.py
       - run: python scripts/run_schema_benchmark.py
       - run: python scripts/run_observability_benchmark.py
+      - run: python scripts/run_output_benchmark.py
       - run: docker build -t mcp-agent-firewall:test .

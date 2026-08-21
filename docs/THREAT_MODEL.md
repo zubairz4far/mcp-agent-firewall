@@ -1,26 +1,28 @@
-# Threat model — MCP Agent Firewall v0.4
+# Threat model — MCP Agent Firewall v0.5
 
 ## Assets to protect
 
 - downstream MCP tools and the external side effects they can cause
-- the trusted definition of which tool contracts are authorized
-- credentials used by the upstream MCP server
+- the trusted definition of authorized tool contracts
+- upstream MCP credentials and credentials accidentally returned by tools
 - user data present in tool arguments and responses
-- human approval authority and approval-signing key material
+- human approval authority and signing-key material
 - audit integrity and traceability
 - telemetry confidentiality, integrity, and bounded cardinality
+- the agent's instruction boundary when consuming untrusted tool output
 
 ## Trust boundaries
 
-1. **Agent/MCP client → firewall**: untrusted. The client may be confused, compromised, or influenced by prompt injection.
-2. **Firewall policy configuration**: trusted administrative input controlling coarse allow/deny/approval classes.
-3. **Pinned trusted tool catalog**: trusted administrative input defining exact executable tool names, JSON Schema contracts, and permitted `x-mcp-header` mappings. Its canonical SHA-256 is pinned separately from its path.
+1. **Agent/MCP client → firewall**: untrusted. The client may be compromised or influenced by prompt injection.
+2. **Firewall policy configuration**: trusted administrative input for coarse allow/deny/approval classes.
+3. **Pinned trusted tool catalog**: trusted exact tool names, JSON Schema contracts, and `x-mcp-header` mappings, pinned by canonical SHA-256.
 4. **Approval issuer operator**: trusted human/operator interface authenticated separately from the MCP caller.
 5. **Approval signing key**: trusted deployment secret held only by the firewall.
-6. **Firewall SQLite state**: trusted single-instance state for audit and one-time receipt consumption.
-7. **Firewall → upstream MCP server**: configured transport destination. Live upstream discovery is not treated as authorization authority.
-8. **Firewall → OpenTelemetry collector/backend**: optional configured observability boundary. The collector/backend must be treated as security-sensitive operational infrastructure.
-9. **Tool output → agent**: untrusted content. v0.4 still passes upstream responses through without output DLP or sanitization.
+6. **Firewall SQLite state**: trusted single-instance state for request/output audit and one-time receipt consumption.
+7. **Firewall → upstream MCP server**: configured transport destination. Live upstream discovery is not authorization authority.
+8. **Upstream MCP response → firewall**: untrusted data, even when the request itself was authorized.
+9. **Firewall → agent**: only output that passes deterministic response containment is returned; all passed-through upstream output is explicitly labeled untrusted.
+10. **Firewall → OpenTelemetry collector/backend**: optional security-sensitive operational boundary.
 
 ## Primary threats and controls
 
@@ -28,7 +30,7 @@
 
 An attacker may present benign MCP headers while asking the JSON-RPC body to execute a different operation.
 
-**Control:** deterministic `Mcp-Name` / `Mcp-Method` consistency checks fail closed. Trusted `x-mcp-header` mappings additionally require `Mcp-Param-*` values to agree with the exact body arguments.
+**Control:** deterministic `Mcp-Name` / `Mcp-Method` consistency checks fail closed. Trusted `x-mcp-header` mappings require `Mcp-Param-*` values to agree with the exact body arguments.
 
 ### Broad policy pattern captures an unreviewed tool
 
@@ -38,23 +40,11 @@ A wildcard such as `read_*` may match a newly exposed upstream tool.
 
 ### Tool-schema drift or upstream redefinition
 
-An upstream server may change a tool's argument schema, semantics, or metadata after firewall policy/catalog review.
+An upstream server may change a tool's argument schema or semantics after firewall review.
 
-**Control:** requests are validated against the operator-pinned local JSON Schema 2020-12 contract rather than trusting live discovery metadata.
+**Control:** requests are validated against the operator-pinned local JSON Schema 2020-12 contract rather than live discovery metadata.
 
-**Residual risk:** a pinned schema constrains request shape, not implementation semantics behind the same tool name. v0.4 does not yet reconcile live `tools/list` output against the pinned catalog.
-
-### Malicious or ambiguous trusted schema
-
-A catalog may contain invalid, external, excessively deep, or structurally ambiguous schemas.
-
-**Control:** duplicate JSON keys, invalid schemas, external `$ref` / `$dynamicRef`, excessive depth/node/tool counts, non-object roots, duplicate tool names, and unsupported/ambiguous `x-mcp-header` annotations fail catalog loading.
-
-### Trusted catalog replacement
-
-An attacker with filesystem access may replace the catalog while preserving its path.
-
-**Control:** startup verifies the canonical parsed catalog SHA-256 against a separately configured digest. A custom path without an explicit valid pin fails closed.
+**Residual risk:** a pinned input schema constrains request shape, not implementation semantics behind the same tool name. Live `tools/list` drift reconciliation is not implemented yet.
 
 ### Argument or routing-header smuggling
 
@@ -74,118 +64,125 @@ An attacker may alter an approved request, replay it, use it after expiry, or us
 
 **Control:** HMAC-SHA256 receipts bind the exact canonical request hash, tool, method, protocol version, policy version, approver metadata, timestamps, and unique `jti`. Receipts expire and are atomically consumed once before dispatch.
 
-### Approval signing-key compromise
+### Credential or secret leakage in upstream output
 
-If the symmetric signing key is exposed, an attacker can forge receipts.
+An authorized tool may return credentials accidentally or maliciously. A compromised upstream server could also try to make the agent ingest secrets.
 
-**Control:** keys must be at least 32 bytes and are never returned by the API. Secret management and rotation remain deployment responsibilities.
+**v0.5 control:** every upstream response is inspected before it is returned. Deterministic DLP blocks:
 
-### Uncertain upstream outcome
+- structured secret-bearing keys such as `access_token`, `refresh_token`, `api_key`, `private_key`, `authorization`, `password`, and related variants
+- PEM private-key material
+- bearer credentials
+- AWS access-key IDs
+- GitHub-style tokens
+- OpenAI-style `sk-` credentials
+- JWT-shaped credential strings
 
-The firewall may consume an approval and lose the connection after the upstream action has potentially executed.
+Blocked content is replaced with firewall JSON-RPC error `-32046`; the original response body is never echoed in the error.
 
-**Control:** the receipt remains spent after dispatch begins; consequential requests are not automatically retried with the same approval.
+**Residual risk:** pattern matching is intentionally conservative and cannot recognize every proprietary credential format. False positives are possible for content that intentionally discusses credential-shaped strings.
 
-### Sensitive argument/audit leakage
+### Prompt injection in tool output
 
-Raw tool arguments may contain private data or secrets.
+An upstream result may contain instructions such as “ignore previous instructions” intended to manipulate the agent.
 
-**Control:** deterministic sensitive-key/path checks run before forwarding. Audit records store request fingerprints and bounded metadata rather than raw request bodies/arguments.
+**v0.5 control:** output prompt-injection patterns are deterministic **signals**, not authorization authority. A response containing only an injection signal is passed through but receives:
 
-### Telemetry exfiltration of request data
+- `Mcp-Firewall-Untrusted-Content: true`
+- `Mcp-Firewall-Output-Inspection: flagged`
+- `Mcp-Firewall-Output-Signals: prompt_injection_signal`
 
-Observability instrumentation can accidentally become a second data-exfiltration channel by recording tool arguments, bodies, tokens, approvals, or PII.
+All clean upstream responses are also labeled `Mcp-Firewall-Untrusted-Content: true` so callers do not confuse tool output with trusted instructions.
 
-**v0.4 control:** the `FirewallObservability` API accepts control-plane outcomes/metadata, not raw argument/body objects. Current telemetry attributes deliberately exclude raw tool arguments, raw bodies, approval receipts, approver identities, and authorization tokens. Request identity is represented by SHA-256 fingerprint rather than raw content.
+**Residual risk:** labels require the consuming agent/client to preserve the trust distinction. Regex signals are incomplete and are not claimed to solve prompt injection.
 
-**Regression evidence:** the observability CI benchmark injects a secret sentinel into a real MCP request and asserts that the sentinel is absent from captured span attributes/events and metric measurements. This is a targeted regression test, not universal proof that future instrumentation/configuration cannot leak sensitive data.
+### Content-type evasion
+
+An upstream server may return JSON containing structured secrets while declaring a misleading non-JSON media type.
+
+**v0.5 control:** UTF-8 responses beginning with `{` or `[` are JSON-parsed and recursively scanned even when the declared content type is not JSON.
+
+### Malformed, binary, oversized, or pathological responses
+
+An attacker may use invalid JSON, opaque binary bytes, excessive response size, extreme nesting, or huge JSON structures to bypass inspection or exhaust resources.
+
+**v0.5 control:** response inspection fails closed on:
+
+- declared JSON that cannot be parsed
+- non-UTF-8 binary content
+- responses larger than `MAX_RESPONSE_BYTES` (default 262,144 bytes)
+- JSON deeper than 32 levels
+- JSON traversals above 10,000 nodes
+
+**Residual risk:** upstream responses are currently buffered by `httpx` before the size check, so `MAX_RESPONSE_BYTES` bounds inspection/return behavior but is not yet a streaming network-memory limit.
+
+### Sensitive request/audit leakage
+
+Raw tool arguments or responses may contain private data or secrets.
+
+**Control:** request audit stores request fingerprints and bounded metadata rather than raw request bodies. Output audit stores only response SHA-256, byte length, outcome, and fixed-vocabulary signals; raw output is not persisted.
+
+### Telemetry exfiltration of request/output data
+
+Observability can accidentally become a second data-exfiltration channel.
+
+**Control:** telemetry receives control-plane metadata, bounded outcome labels, and signal classes—not raw arguments, request bodies, response bodies, approval receipts, approver identities, or authorization values. Output metrics use only `outcome` and a bounded `signal_class`.
 
 ### High-cardinality telemetry denial of service / cost explosion
 
-Attacker-controlled values in metric labels can create unbounded series cardinality and excessive backend cost/resource use.
+Attacker-controlled strings in metric labels can create unbounded series cardinality.
 
-**v0.4 control:** metric dimensions are restricted to bounded sets: decision, risk, normalized method family, schema check/outcome/phase, approval phase/outcome, and normalized upstream status family. Tool names and request fingerprints are trace-only and are never metric dimensions.
+**Control:** metric values are collapsed into fixed sets. Tool names and request fingerprints are trace-only, with trace strings sanitized and length-bounded.
 
-**Residual risk:** trace attributes such as exact tool name and request SHA-256 still create operational metadata volume and may reveal tool usage patterns to a telemetry backend. Collector access and retention should therefore be restricted.
+### Trace-context spoofing
 
-### Trace-context spoofing or malformed propagation
+An untrusted caller may send attacker-chosen trace context.
 
-An untrusted caller may send a malformed or attacker-chosen trace context, or the firewall may forward a caller header verbatim downstream.
-
-**v0.4 control:** incoming HTTP W3C TraceContext is parsed by the OpenTelemetry propagator. The upstream hop receives a newly injected context derived from the firewall's current client span rather than a blind copy of the incoming raw `traceparent` value.
-
-**Residual risk:** trace IDs are correlation metadata, not authentication or authorization. An attacker controlling a valid incoming trace context can influence correlation identity, so no security decision depends on trace context.
-
-### Telemetry collector compromise or misconfiguration
-
-A configured OTLP collector/backend may be compromised, overly permissive, or retained longer than intended.
-
-**v0.4 control:** telemetry export is off by default. OTLP HTTP export is created only when configured. The firewall's security decisions do not depend on collector availability.
-
-**Residual risk:** when export is enabled, control-plane trace metadata leaves the firewall process and inherits the collector/backend's confidentiality, access-control, retention, and transport posture.
-
-### Prompt injection
-
-Untrusted content may try to override the agent's instructions and trigger unintended calls.
-
-**Control:** prompt-injection-like text is only a signal. Protocol integrity, deterministic policy, pinned schemas, argument constraints, and human approval remain authoritative.
+**Control:** only W3C TraceContext is extracted. Upstream receives newly injected context from the firewall's current client span, not a blind copy of the incoming header. No security decision depends on tracing.
 
 ### Credential confused-deputy behavior
 
 A caller may try to smuggle caller authorization to the upstream server.
 
-**Control:** caller authorization is not forwarded. Upstream bearer auth is separately deployment-configured and is excluded from telemetry attributes.
+**Control:** caller authorization is not forwarded. Upstream bearer auth is separately deployment-configured.
 
 ### Resource exhaustion
 
-A client may flood the gateway, send oversized requests, or provide pathological trusted schemas.
+A client may flood the gateway or provide pathological input.
 
-**Control:** bounded request bodies, per-process sliding-window rate limiting, and bounded catalog/schema size/depth.
+**Control:** bounded request bodies, per-process sliding-window rate limiting, bounded tool catalogs/schemas, and bounded response inspection.
 
-## Observability-specific privacy contract
+## Output containment privacy contract
 
-Current trace attributes may include:
+Returned upstream data is always labeled untrusted. Output inspection metadata may include only:
 
-- MCP method / normalized method family
-- protocol version
-- exact tool name
-- request SHA-256 fingerprint
-- firewall policy version
-- trusted catalog version
-- policy decision / risk
-- schema and approval outcomes
-- upstream status/outcome
+- `clean`, `flagged`, or `blocked` outcome
+- fixed-vocabulary output signals
+- fixed-vocabulary telemetry signal class
+- response byte length in the output audit
+- response SHA-256 in the output audit
 
-Current metric dimensions are limited to:
-
-- policy: `decision`, `risk`, `method_family`
-- schema: `check`, `outcome`, `phase`
-- approval: `phase`, `outcome`
-- upstream latency: `outcome`
-
-Current instrumentation must not add raw request arguments, bodies, responses, approval receipts, approver identities, or authorization values as telemetry attributes/dimensions without an explicit threat-model and privacy review.
+Raw upstream response bodies must not be added to SQLite audit or telemetry without an explicit threat-model/privacy review.
 
 ## Explicit non-goals / residual risk
 
-- v0.4 is not a complete prompt-injection detector.
-- the pinned catalog is static local administrative state; secure remote distribution/signing/rotation is not implemented.
-- live upstream `tools/list` drift detection/reconciliation is not implemented.
+- v0.5 is not a complete prompt-injection detector.
+- response DLP focuses on credentials/secrets, not general PII classification.
+- opaque binary MCP payload support is intentionally fail-closed in this milestone.
+- response-size enforcement is post-buffer rather than streaming.
+- live upstream `tools/list` drift detection is not implemented.
 - a trusted input schema cannot prove benign upstream implementation semantics.
-- SQLite replay state and the in-memory rate limiter are single-instance controls, not distributed coordination primitives.
-- approval issuer auth remains a shared-secret baseline rather than phishing-resistant operator identity.
-- HMAC approval signing has no key IDs or overlapping rotation window yet.
-- upstream tool responses are not yet passed through DLP, sanitization, or explicit untrusted-content labeling.
-- OTLP collector/backend confidentiality, retention, and access controls are outside the application boundary.
-- the sentinel regression benchmark is targeted evidence, not a comprehensive information-flow proof.
-- no OpenTelemetry `baggage` propagation is intentionally implemented; v0.4 focuses on W3C trace context.
+- SQLite replay/audit state and the in-memory rate limiter are single-instance controls.
+- approval signing has no key IDs or overlapping rotation window yet.
+- OTLP collector/backend security and retention remain deployment responsibilities.
 - there is no OPA/Rego backend yet.
 
 ## Next hardening milestones
 
-1. response-side DLP / explicit untrusted-content labeling
-2. approval signing-key rotation with key IDs and bounded verification overlap
-3. shared receipt/rate-limit state for multi-replica deployments
+1. approval signing-key rotation with key IDs and bounded verification overlap
+2. streaming response-size enforcement and optional safe content-type allowlists
+3. shared receipt/rate-limit state for multi-replica deployment
 4. live upstream `tools/list` drift detection against the pinned catalog
 5. optional OPA/Rego backend with deterministic local fallback
-6. adversarial corpus derived from real MCP traces rather than only synthetic fixtures
-7. broader protocol metadata consistency checks beyond the `tools/call` boundary
+6. adversarial corpus derived from real MCP traces
+7. broader protocol metadata consistency checks beyond `tools/call`

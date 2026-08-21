@@ -15,7 +15,7 @@ from app.policy import canonical_payload
 
 
 class AuditStore:
-    """Privacy-minimized audit and approval-consumption store."""
+    """Privacy-minimized audit, output-containment, and approval-consumption store."""
 
     def __init__(self, path: str):
         self.path = path
@@ -44,6 +44,20 @@ class AuditStore:
                     signals_json TEXT NOT NULL,
                     payload_sha256 TEXT NOT NULL,
                     traceparent TEXT
+                )
+                """
+            )
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS output_events (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    created_at TEXT NOT NULL,
+                    method TEXT NOT NULL,
+                    tool_name TEXT,
+                    outcome TEXT NOT NULL,
+                    signals_json TEXT NOT NULL,
+                    response_sha256 TEXT NOT NULL,
+                    response_bytes INTEGER NOT NULL
                 )
                 """
             )
@@ -96,6 +110,35 @@ class AuditStore:
                     json.dumps(result.signals),
                     digest,
                     traceparent,
+                ),
+            )
+
+    def append_output(
+        self,
+        *,
+        method: str,
+        tool_name: str | None,
+        outcome: str,
+        signals: tuple[str, ...],
+        content: bytes,
+    ) -> None:
+        digest = hashlib.sha256(content).hexdigest()
+        with self._lock, self._connect() as conn:
+            conn.execute(
+                """
+                INSERT INTO output_events (
+                    created_at, method, tool_name, outcome, signals_json,
+                    response_sha256, response_bytes
+                ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    datetime.now(UTC).isoformat(),
+                    method,
+                    tool_name,
+                    outcome,
+                    json.dumps(list(signals)),
+                    digest,
+                    len(content),
                 ),
             )
 
@@ -156,5 +199,13 @@ class AuditStore:
         with self._connect() as conn:
             rows = conn.execute(
                 "SELECT * FROM audit_events ORDER BY id DESC LIMIT ?", (limit,)
+            ).fetchall()
+        return [dict(row) for row in rows]
+
+    def recent_outputs(self, limit: int = 50) -> list[dict[str, Any]]:
+        limit = max(1, min(limit, 200))
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT * FROM output_events ORDER BY id DESC LIMIT ?", (limit,)
             ).fetchall()
         return [dict(row) for row in rows]
