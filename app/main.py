@@ -477,6 +477,8 @@ async def proxy_mcp(
 
         started = time.perf_counter()
         with observability.stage("mcp.upstream.dispatch", kind=SpanKind.CLIENT) as upstream_span:
+            for header_name, header_value in observability.trace_context_headers().items():
+                forward_headers[header_name] = header_value
             try:
                 async with httpx.AsyncClient(timeout=30.0, follow_redirects=False) as client:
                     upstream = await client.post(
