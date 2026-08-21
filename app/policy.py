@@ -29,7 +29,7 @@ class PolicyConfig:
     injection_patterns: tuple[str, ...]
 
     @classmethod
-    def load(cls, path: str | Path) -> "PolicyConfig":
+    def load(cls, path: str | Path) -> PolicyConfig:
         data = yaml.safe_load(Path(path).read_text(encoding="utf-8"))
         args = data.get("argument_constraints", {})
         injection = data.get("injection_signals", {})
@@ -74,13 +74,23 @@ class PolicyEngine:
             )
 
         if request.mcp_method != body_method:
-            return self._deny(request, tool_name, "mcp_method_header_body_mismatch", RiskLevel.CRITICAL)
+            return self._deny(
+                request,
+                tool_name,
+                "mcp_method_header_body_mismatch",
+                RiskLevel.CRITICAL,
+            )
 
         if body_method == "tools/call":
             if not isinstance(body_name, str) or not body_name:
                 return self._deny(request, tool_name, "missing_tool_name", RiskLevel.HIGH)
             if request.mcp_name != body_name:
-                return self._deny(request, tool_name, "mcp_name_header_body_mismatch", RiskLevel.CRITICAL)
+                return self._deny(
+                    request,
+                    tool_name,
+                    "mcp_name_header_body_mismatch",
+                    RiskLevel.CRITICAL,
+                )
 
         if body_method not in self.policy.allowed_methods:
             return self._deny(request, tool_name, "method_not_allowed", RiskLevel.HIGH)
@@ -185,9 +195,13 @@ class PolicyEngine:
                     deny_reasons.append(f"protected_path:{'.'.join(path)}")
                 if key in self.policy.injection_fields and self._looks_like_injection(value):
                     signals.append(f"prompt_injection_signal:{'.'.join(path)}")
-            if key == "amount" and isinstance(value, (int, float)) and not isinstance(value, bool):
-                if float(value) > self.policy.amount_limit:
-                    approval_reasons.append("amount_exceeds_auto_approval_limit")
+            if (
+                key == "amount"
+                and isinstance(value, (int, float))
+                and not isinstance(value, bool)
+                and float(value) > self.policy.amount_limit
+            ):
+                approval_reasons.append("amount_exceeds_auto_approval_limit")
 
         walk(arguments)
         return {
@@ -226,4 +240,5 @@ class PolicyEngine:
 
 
 def canonical_payload(body: dict[str, Any]) -> bytes:
-    return json.dumps(body, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
+    payload = json.dumps(body, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+    return payload.encode("utf-8")
