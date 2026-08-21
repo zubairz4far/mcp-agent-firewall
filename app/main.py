@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 import secrets
+import time
 from pathlib import Path
 from typing import Any
 
@@ -20,6 +21,7 @@ from app.audit import AuditStore
 from app.models import Decision, EvaluationInput, McpEnvelope
 from app.policy import PolicyConfig, PolicyEngine
 from app.rate_limit import SlidingWindowRateLimiter
+from app.telemetry import RequestObservation, telemetry
 from app.tool_catalog import (
     ToolCatalogError,
     TrustedToolCatalog,
@@ -66,7 +68,7 @@ tool_catalog = TrustedToolCatalog.load(
 if tool_catalog.protocol_version != policy.protocol_version:
     raise RuntimeError("trusted tool catalog protocol version does not match policy")
 
-app = FastAPI(title="MCP Agent Firewall", version="0.3.0")
+app = FastAPI(title="MCP Agent Firewall", version="0.4.0")
 
 
 def _client_name(body: dict[str, Any]) -> str | None:
@@ -161,6 +163,19 @@ def _catalog_error_response(body: dict[str, Any], error: ToolCatalogError) -> JS
     )
 
 
+def _observed(
+    observation: RequestObservation,
+    response: Response,
+    *,
+    outcome: str,
+    reject_stage: str | None = None,
+) -> Response:
+    if reject_stage:
+        telemetry.reject(observation, stage=reject_stage, outcome=outcome)
+    telemetry.finish(observation, outcome=outcome)
+    return response
+
+
 @app.get("/health")
 def health() -> dict[str, str]:
     return {
@@ -169,6 +184,7 @@ def health() -> dict[str, str]:
         "approval_mode": "signed_receipts" if approval_receipts.configured else "disabled",
         "tool_catalog_version": tool_catalog.catalog_version,
         "tool_catalog_sha256": tool_catalog.digest,
+        "telemetry": "otlp" if telemetry.enabled else "disabled",
     }
 
 
@@ -231,26 +247,83 @@ async def proxy_mcp(
     mcp_method: str = Header(alias="Mcp-Method"),
     mcp_name: str | None = Header(default=None, alias="Mcp-Name"),
     human_approval: str | None = Header(default=None, alias="X-Human-Approval"),
+    traceparent_header: str | None = Header(default=None, alias="traceparent"),
+) -> Response:
+    with telemetry.request_span(
+        method=mcp_method,
+        tool_name=mcp_name,
+        policy_version=policy.version,
+        catalog_version=tool_catalog.catalog_version,
+        traceparent=traceparent_header,
+    ) as observation:
+        return await _proxy_mcp_observed(
+            request=request,
+            observation=observation,
+            mcp_protocol_version=mcp_protocol_version,
+            mcp_method=mcp_method,
+            mcp_name=mcp_name,
+            human_approval=human_approval,
+        )
+
+
+async def _proxy_mcp_observed(
+    *,
+    request: Request,
+    observation: RequestObservation,
+    mcp_protocol_version: str,
+    mcp_method: str,
+    mcp_name: str | None,
+    human_approval: str | None,
 ) -> Response:
     client_key = request.client.host if request.client else "unknown"
     if not rate_limiter.allow(client_key):
-        raise HTTPException(status_code=429, detail="gateway_rate_limit_exceeded")
+        response = JSONResponse(status_code=429, content={"detail": "gateway_rate_limit_exceeded"})
+        return _observed(
+            observation,
+            response,
+            outcome="rate_limited",
+            reject_stage="transport",
+        )
 
     raw = await request.body()
     if len(raw) > MAX_BODY_BYTES:
-        raise HTTPException(status_code=413, detail="request_body_too_large")
+        response = JSONResponse(status_code=413, content={"detail": "request_body_too_large"})
+        return _observed(
+            observation,
+            response,
+            outcome="invalid_request",
+            reject_stage="transport",
+        )
 
     try:
         body = await request.json()
-    except Exception as exc:
-        raise HTTPException(status_code=400, detail="invalid_json") from exc
+    except Exception:
+        response = JSONResponse(status_code=400, content={"detail": "invalid_json"})
+        return _observed(
+            observation,
+            response,
+            outcome="invalid_request",
+            reject_stage="transport",
+        )
     if not isinstance(body, dict):
-        raise HTTPException(status_code=400, detail="json_rpc_body_must_be_object")
+        response = JSONResponse(status_code=400, content={"detail": "json_rpc_body_must_be_object"})
+        return _observed(
+            observation,
+            response,
+            outcome="invalid_request",
+            reject_stage="transport",
+        )
 
     try:
         decoded_mcp_name = decode_mcp_header_value(mcp_name) if mcp_name is not None else None
     except ToolCatalogError as exc:
-        return _catalog_error_response(body, exc)
+        response = _catalog_error_response(body, exc)
+        return _observed(
+            observation,
+            response,
+            outcome="schema_rejected",
+            reject_stage="schema",
+        )
 
     try:
         evaluation_input = _evaluation_input(
@@ -259,16 +332,28 @@ async def proxy_mcp(
             mcp_method=mcp_method,
             mcp_name=decoded_mcp_name,
         )
-    except Exception as exc:
-        raise HTTPException(status_code=400, detail="invalid_mcp_envelope") from exc
+    except Exception:
+        response = JSONResponse(status_code=400, content={"detail": "invalid_mcp_envelope"})
+        return _observed(
+            observation,
+            response,
+            outcome="invalid_request",
+            reject_stage="transport",
+        )
 
     result = engine.evaluate(evaluation_input)
+    telemetry.record_decision(observation, result.decision.value)
     client_name = _client_name(body)
-    traceparent = _traceparent(body)
-    audit.append(body=body, result=result, client_name=client_name, traceparent=traceparent)
+    legacy_traceparent = _traceparent(body)
+    audit.append(
+        body=body,
+        result=result,
+        client_name=client_name,
+        traceparent=legacy_traceparent,
+    )
 
     if result.decision == Decision.DENY:
-        return JSONResponse(
+        response = JSONResponse(
             status_code=403,
             content={
                 "jsonrpc": "2.0",
@@ -280,6 +365,7 @@ async def proxy_mcp(
                 },
             },
         )
+        return _observed(observation, response, outcome="denied", reject_stage="policy")
 
     custom_mcp_headers: list[tuple[str, str]] = []
     if evaluation_input.body.method == "tools/call":
@@ -292,12 +378,24 @@ async def proxy_mcp(
                 request.headers.raw,
             )
         except ToolCatalogError as exc:
-            return _catalog_error_response(body, exc)
+            response = _catalog_error_response(body, exc)
+            return _observed(
+                observation,
+                response,
+                outcome="schema_rejected",
+                reject_stage="schema",
+            )
 
     approval_claims = None
     if result.decision == Decision.APPROVAL_REQUIRED:
         if not human_approval:
-            return _approval_error_response(body, result, "approval_receipt_required")
+            response = _approval_error_response(body, result, "approval_receipt_required")
+            return _observed(
+                observation,
+                response,
+                outcome="approval_required",
+                reject_stage="approval",
+            )
         try:
             approval_claims = approval_receipts.verify(
                 human_approval,
@@ -305,10 +403,16 @@ async def proxy_mcp(
                 policy_version=policy.version,
             )
         except ApprovalError as exc:
-            return _approval_error_response(body, result, exc.code)
+            response = _approval_error_response(body, result, exc.code)
+            return _observed(
+                observation,
+                response,
+                outcome="approval_invalid",
+                reject_stage="approval",
+            )
 
     if not UPSTREAM_MCP_URL:
-        return JSONResponse(
+        response = JSONResponse(
             status_code=503,
             content={
                 "jsonrpc": "2.0",
@@ -320,9 +424,10 @@ async def proxy_mcp(
                 },
             },
         )
+        return _observed(observation, response, outcome="upstream_unconfigured")
 
     if approval_claims is not None and not audit.consume_approval(approval_claims):
-        return JSONResponse(
+        response = JSONResponse(
             status_code=409,
             content={
                 "jsonrpc": "2.0",
@@ -332,6 +437,12 @@ async def proxy_mcp(
                     "message": "Approval receipt is unknown, expired, or already consumed",
                 },
             },
+        )
+        return _observed(
+            observation,
+            response,
+            outcome="approval_invalid",
+            reject_stage="approval",
         )
 
     forward_header_items = [
@@ -346,13 +457,37 @@ async def proxy_mcp(
         forward_header_items.append(("authorization", f"Bearer {UPSTREAM_BEARER_TOKEN}"))
     forward_headers = httpx.Headers(forward_header_items)
 
-    async with httpx.AsyncClient(timeout=30.0, follow_redirects=False) as client:
-        upstream = await client.post(UPSTREAM_MCP_URL, content=raw, headers=forward_headers)
+    upstream_started = time.perf_counter()
+    try:
+        async with httpx.AsyncClient(timeout=30.0, follow_redirects=False) as client:
+            upstream = await client.post(UPSTREAM_MCP_URL, content=raw, headers=forward_headers)
+    except httpx.HTTPError as exc:
+        observation.span.set_attribute("error.type", type(exc).__name__[:120])
+        response = JSONResponse(
+            status_code=502,
+            content={
+                "jsonrpc": "2.0",
+                "id": body.get("id"),
+                "error": {
+                    "code": -32046,
+                    "message": "Upstream MCP request failed",
+                },
+            },
+        )
+        return _observed(observation, response, outcome="upstream_error")
+
+    telemetry.record_upstream(
+        observation,
+        duration_seconds=time.perf_counter() - upstream_started,
+        status_code=upstream.status_code,
+    )
     response_headers = {}
     if content_type := upstream.headers.get("content-type"):
         response_headers["content-type"] = content_type
-    return Response(
+    response = Response(
         content=upstream.content,
         status_code=upstream.status_code,
         headers=response_headers,
     )
+    outcome = "upstream_success" if 200 <= upstream.status_code < 400 else "upstream_error"
+    return _observed(observation, response, outcome=outcome)
