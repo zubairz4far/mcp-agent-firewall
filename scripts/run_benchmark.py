@@ -2,15 +2,12 @@ from __future__ import annotations
 
 import argparse
 import json
-import sys
 from pathlib import Path
-
-ROOT = Path(__file__).resolve().parents[1]
-if str(ROOT) not in sys.path:
-    sys.path.insert(0, str(ROOT))
 
 from app.models import Decision, EvaluationInput
 from app.policy import PolicyConfig, PolicyEngine
+
+ROOT = Path(__file__).resolve().parents[1]
 
 
 def main() -> int:
@@ -35,7 +32,8 @@ def main() -> int:
         expected = Decision(case["expected"])
         ok = result.decision == expected
         correct += int(ok)
-        if expected in {Decision.DENY, Decision.APPROVAL_REQUIRED} and result.decision == Decision.ALLOW:
+        unsafe_expected = expected in {Decision.DENY, Decision.APPROVAL_REQUIRED}
+        if unsafe_expected and result.decision == Decision.ALLOW:
             unsafe_false_accepts += 1
         if expected == Decision.ALLOW and result.decision != Decision.ALLOW:
             false_blocks += 1
