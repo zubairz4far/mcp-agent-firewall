@@ -100,7 +100,14 @@ def main() -> int:
         ),
         (
             "malformed_receipt_rejected",
-            rejected(lambda: service.verify("not-a-receipt", original, policy_version="1", now=1010)),
+            rejected(
+                lambda: service.verify(
+                    "not-a-receipt",
+                    original,
+                    policy_version="1",
+                    now=1010,
+                )
+            ),
         ),
     ]
 
