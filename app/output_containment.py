@@ -152,25 +152,29 @@ class OutputContainment:
 
         signals = _text_signals(text)
         media_type = (content_type or "").split(";", 1)[0].strip().lower()
-        looks_json = media_type.endswith("/json") or media_type.endswith("+json")
+        declared_json = media_type.endswith("/json") or media_type.endswith("+json")
+        stripped = text.lstrip()
+        looks_json = declared_json or stripped.startswith("{") or stripped.startswith("[")
 
         if looks_json:
             try:
                 parsed = json.loads(text)
             except json.JSONDecodeError:
-                return OutputInspection(
-                    action=OutputAction.BLOCK,
-                    signals=("invalid_json_response",),
-                    inspected_bytes=size,
-                )
-            json_signals, complete = _walk_json(parsed)
-            signals.update(json_signals)
-            if not complete:
-                return OutputInspection(
-                    action=OutputAction.BLOCK,
-                    signals=tuple(sorted(signals)),
-                    inspected_bytes=size,
-                )
+                if declared_json:
+                    return OutputInspection(
+                        action=OutputAction.BLOCK,
+                        signals=("invalid_json_response",),
+                        inspected_bytes=size,
+                    )
+            else:
+                json_signals, complete = _walk_json(parsed)
+                signals.update(json_signals)
+                if not complete:
+                    return OutputInspection(
+                        action=OutputAction.BLOCK,
+                        signals=tuple(sorted(signals)),
+                        inspected_bytes=size,
+                    )
 
         blocking_signals = signals - {"prompt_injection_signal"}
         action = OutputAction.BLOCK if blocking_signals else OutputAction.ALLOW
