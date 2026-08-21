@@ -2,22 +2,26 @@ from __future__ import annotations
 
 import os
 import secrets
+import time
 from pathlib import Path
 from typing import Any
 
 import httpx
 from fastapi import FastAPI, Header, HTTPException, Request
 from fastapi.responses import JSONResponse, Response
+from opentelemetry.trace import SpanKind
 
 from app.approval import (
     ApprovalError,
     ApprovalIssueRequest,
     ApprovalIssueResponse,
     ApprovalReceiptService,
+    approval_request_hash,
     response_from_issued,
 )
 from app.audit import AuditStore
 from app.models import Decision, EvaluationInput, McpEnvelope
+from app.observability import configure_observability, status_family
 from app.policy import PolicyConfig, PolicyEngine
 from app.rate_limit import SlidingWindowRateLimiter
 from app.tool_catalog import (
@@ -26,6 +30,7 @@ from app.tool_catalog import (
     decode_mcp_header_value,
 )
 
+SERVICE_VERSION = "0.4.0"
 ROOT = Path(__file__).resolve().parents[1]
 POLICY_PATH = os.getenv("POLICY_PATH", str(ROOT / "config" / "policy.example.yaml"))
 AUDIT_DB_PATH = os.getenv("AUDIT_DB_PATH", str(ROOT / "data" / "audit.db"))
@@ -66,7 +71,8 @@ tool_catalog = TrustedToolCatalog.load(
 if tool_catalog.protocol_version != policy.protocol_version:
     raise RuntimeError("trusted tool catalog protocol version does not match policy")
 
-app = FastAPI(title="MCP Agent Firewall", version="0.3.0")
+observability = configure_observability(service_version=SERVICE_VERSION)
+app = FastAPI(title="MCP Agent Firewall", version=SERVICE_VERSION)
 
 
 def _client_name(body: dict[str, Any]) -> str | None:
@@ -161,14 +167,26 @@ def _catalog_error_response(body: dict[str, Any], error: ToolCatalogError) -> JS
     )
 
 
+def _request_outcome_from_status(status_code: int) -> str:
+    family = status_family(status_code)
+    return {
+        "2xx": "upstream_success",
+        "3xx": "upstream_redirect",
+        "4xx": "upstream_client_error",
+        "5xx": "upstream_server_error",
+    }.get(family, "upstream_other")
+
+
 @app.get("/health")
-def health() -> dict[str, str]:
+def health() -> dict[str, Any]:
     return {
         "status": "ok",
         "policy_version": policy.version,
         "approval_mode": "signed_receipts" if approval_receipts.configured else "disabled",
         "tool_catalog_version": tool_catalog.catalog_version,
         "tool_catalog_sha256": tool_catalog.digest,
+        "telemetry_mode": observability.mode,
+        "telemetry_exporting": observability.exporting,
     }
 
 
@@ -182,36 +200,71 @@ def issue_approval(
     payload: ApprovalIssueRequest,
     operator_token: str | None = Header(default=None, alias="X-Operator-Token"),
 ) -> ApprovalIssueResponse:
-    if (
-        not APPROVAL_ISSUER_TOKEN
-        or not operator_token
-        or not secrets.compare_digest(operator_token, APPROVAL_ISSUER_TOKEN)
-    ):
-        raise HTTPException(status_code=403, detail="approval_issuer_access_denied")
+    with observability.stage(
+        "mcp.approval.issue",
+        attributes={
+            "mcp.method": payload.request.mcp_method,
+            "firewall.policy.version": policy.version,
+            "firewall.catalog.version": tool_catalog.catalog_version,
+        },
+    ) as issue_span:
+        if (
+            not APPROVAL_ISSUER_TOKEN
+            or not operator_token
+            or not secrets.compare_digest(operator_token, APPROVAL_ISSUER_TOKEN)
+        ):
+            observability.record_approval(phase="issue", outcome="access_denied", span=issue_span)
+            raise HTTPException(status_code=403, detail="approval_issuer_access_denied")
 
-    result = engine.evaluate(payload.request)
-    if result.decision != Decision.APPROVAL_REQUIRED:
-        raise HTTPException(status_code=409, detail="request_does_not_require_human_approval")
+        result = engine.evaluate(payload.request)
+        if result.decision != Decision.APPROVAL_REQUIRED:
+            observability.record_approval(phase="issue", outcome="not_required", span=issue_span)
+            raise HTTPException(status_code=409, detail="request_does_not_require_human_approval")
 
-    try:
-        tool_name, arguments = _tool_name_and_arguments(payload.request)
-        tool_catalog.validate_arguments(tool_name, arguments)
-    except ToolCatalogError as exc:
-        raise HTTPException(status_code=400, detail=exc.data()) from exc
+        with observability.stage(
+            "mcp.schema.validate",
+            attributes={"firewall.schema.phase": "issue"},
+        ) as schema_span:
+            try:
+                tool_name, arguments = _tool_name_and_arguments(payload.request)
+                tool_catalog.validate_arguments(tool_name, arguments)
+            except ToolCatalogError as exc:
+                observability.record_schema(
+                    check="arguments",
+                    outcome="rejected",
+                    phase="issue",
+                    span=schema_span,
+                )
+                schema_span.set_attribute("error.type", exc.code)
+                observability.record_approval(
+                    phase="issue",
+                    outcome="schema_rejected",
+                    span=issue_span,
+                )
+                raise HTTPException(status_code=400, detail=exc.data()) from exc
+            observability.record_schema(
+                check="arguments",
+                outcome="accepted",
+                phase="issue",
+                span=schema_span,
+            )
 
-    try:
-        receipt, claims = approval_receipts.issue(
-            payload.request,
-            policy_version=policy.version,
-            approver=payload.approver,
-            ttl_seconds=payload.ttl_seconds,
-        )
-    except ApprovalError as exc:
-        status_code = 503 if exc.code == "approval_signing_not_configured" else 400
-        raise HTTPException(status_code=status_code, detail=exc.code) from exc
+        try:
+            receipt, claims = approval_receipts.issue(
+                payload.request,
+                policy_version=policy.version,
+                approver=payload.approver,
+                ttl_seconds=payload.ttl_seconds,
+            )
+        except ApprovalError as exc:
+            observability.record_approval(phase="issue", outcome="rejected", span=issue_span)
+            issue_span.set_attribute("error.type", exc.code)
+            status_code = 503 if exc.code == "approval_signing_not_configured" else 400
+            raise HTTPException(status_code=status_code, detail=exc.code) from exc
 
-    audit.register_approval(claims)
-    return response_from_issued(receipt, claims)
+        audit.register_approval(claims)
+        observability.record_approval(phase="issue", outcome="issued", span=issue_span)
+        return response_from_issued(receipt, claims)
 
 
 @app.get("/v1/audit")
@@ -262,97 +315,207 @@ async def proxy_mcp(
     except Exception as exc:
         raise HTTPException(status_code=400, detail="invalid_mcp_envelope") from exc
 
-    result = engine.evaluate(evaluation_input)
-    client_name = _client_name(body)
-    traceparent = _traceparent(body)
-    audit.append(body=body, result=result, client_name=client_name, traceparent=traceparent)
-
-    if result.decision == Decision.DENY:
-        return JSONResponse(
-            status_code=403,
-            content={
-                "jsonrpc": "2.0",
-                "id": body.get("id"),
-                "error": {
-                    "code": -32040,
-                    "message": "Blocked by MCP Agent Firewall",
-                    "data": result.model_dump(mode="json"),
-                },
-            },
-        )
-
-    custom_mcp_headers: list[tuple[str, str]] = []
-    if evaluation_input.body.method == "tools/call":
-        try:
-            tool_name, arguments = _tool_name_and_arguments(evaluation_input)
-            tool_catalog.validate_arguments(tool_name, arguments)
-            custom_mcp_headers = tool_catalog.validate_mcp_param_headers(
-                tool_name,
-                arguments,
-                request.headers.raw,
+    with observability.request_span(
+        headers=dict(request.headers),
+        method=evaluation_input.mcp_method,
+        protocol_version=evaluation_input.protocol_version,
+        tool_name=evaluation_input.mcp_name,
+        request_sha256=approval_request_hash(evaluation_input),
+        policy_version=policy.version,
+        catalog_version=tool_catalog.catalog_version,
+    ) as request_span:
+        with observability.stage("mcp.policy.evaluate") as policy_span:
+            result = engine.evaluate(evaluation_input)
+            observability.record_policy(
+                decision=result.decision.value,
+                risk=result.risk.value,
+                method=evaluation_input.mcp_method,
+                span=policy_span,
             )
-        except ToolCatalogError as exc:
-            return _catalog_error_response(body, exc)
+        request_span.set_attribute("firewall.decision", result.decision.value)
+        request_span.set_attribute("firewall.risk", result.risk.value)
 
-    approval_claims = None
-    if result.decision == Decision.APPROVAL_REQUIRED:
-        if not human_approval:
-            return _approval_error_response(body, result, "approval_receipt_required")
-        try:
-            approval_claims = approval_receipts.verify(
-                human_approval,
-                evaluation_input,
-                policy_version=policy.version,
+        client_name = _client_name(body)
+        traceparent = request.headers.get("traceparent") or _traceparent(body)
+        audit.append(
+            body=body,
+            result=result,
+            client_name=client_name,
+            traceparent=traceparent[:256] if traceparent else None,
+        )
+
+        if result.decision == Decision.DENY:
+            request_span.set_attribute("firewall.outcome", "blocked_policy")
+            return JSONResponse(
+                status_code=403,
+                content={
+                    "jsonrpc": "2.0",
+                    "id": body.get("id"),
+                    "error": {
+                        "code": -32040,
+                        "message": "Blocked by MCP Agent Firewall",
+                        "data": result.model_dump(mode="json"),
+                    },
+                },
             )
-        except ApprovalError as exc:
-            return _approval_error_response(body, result, exc.code)
 
-    if not UPSTREAM_MCP_URL:
-        return JSONResponse(
-            status_code=503,
-            content={
-                "jsonrpc": "2.0",
-                "id": body.get("id"),
-                "error": {
-                    "code": -32042,
-                    "message": "Policy allowed the call but no upstream MCP server is configured",
-                    "data": result.model_dump(mode="json"),
+        custom_mcp_headers: list[tuple[str, str]] = []
+        if evaluation_input.body.method == "tools/call":
+            schema_check = "arguments"
+            with observability.stage(
+                "mcp.schema.validate",
+                attributes={"firewall.schema.phase": "dispatch"},
+            ) as schema_span:
+                try:
+                    tool_name, arguments = _tool_name_and_arguments(evaluation_input)
+                    tool_catalog.validate_arguments(tool_name, arguments)
+                    observability.record_schema(
+                        check="arguments",
+                        outcome="accepted",
+                        phase="dispatch",
+                        span=schema_span,
+                    )
+                    schema_check = "headers"
+                    custom_mcp_headers = tool_catalog.validate_mcp_param_headers(
+                        tool_name,
+                        arguments,
+                        request.headers.raw,
+                    )
+                    observability.record_schema(
+                        check="headers",
+                        outcome="accepted",
+                        phase="dispatch",
+                        span=schema_span,
+                    )
+                except ToolCatalogError as exc:
+                    observability.record_schema(
+                        check=schema_check,
+                        outcome="rejected",
+                        phase="dispatch",
+                        span=schema_span,
+                    )
+                    schema_span.set_attribute("error.type", exc.code)
+                    request_span.set_attribute("firewall.outcome", "schema_rejected")
+                    return _catalog_error_response(body, exc)
+
+        approval_claims = None
+        if result.decision == Decision.APPROVAL_REQUIRED:
+            with observability.stage("mcp.approval.verify") as approval_span:
+                if not human_approval:
+                    observability.record_approval(
+                        phase="verify",
+                        outcome="missing",
+                        span=approval_span,
+                    )
+                    request_span.set_attribute("firewall.outcome", "approval_missing")
+                    return _approval_error_response(body, result, "approval_receipt_required")
+                try:
+                    approval_claims = approval_receipts.verify(
+                        human_approval,
+                        evaluation_input,
+                        policy_version=policy.version,
+                    )
+                except ApprovalError as exc:
+                    observability.record_approval(
+                        phase="verify",
+                        outcome="rejected",
+                        span=approval_span,
+                    )
+                    approval_span.set_attribute("error.type", exc.code)
+                    request_span.set_attribute("firewall.outcome", "approval_rejected")
+                    return _approval_error_response(body, result, exc.code)
+                observability.record_approval(
+                    phase="verify",
+                    outcome="accepted",
+                    span=approval_span,
+                )
+
+        if not UPSTREAM_MCP_URL:
+            request_span.set_attribute("firewall.outcome", "no_upstream")
+            return JSONResponse(
+                status_code=503,
+                content={
+                    "jsonrpc": "2.0",
+                    "id": body.get("id"),
+                    "error": {
+                        "code": -32042,
+                        "message": (
+                            "Policy allowed the call but no upstream MCP server is configured"
+                        ),
+                        "data": result.model_dump(mode="json"),
+                    },
                 },
-            },
+            )
+
+        if approval_claims is not None:
+            with observability.stage("mcp.approval.consume") as consume_span:
+                consumed = audit.consume_approval(approval_claims)
+                observability.record_approval(
+                    phase="consume",
+                    outcome="consumed" if consumed else "rejected",
+                    span=consume_span,
+                )
+            if not consumed:
+                request_span.set_attribute("firewall.outcome", "approval_replay_rejected")
+                return JSONResponse(
+                    status_code=409,
+                    content={
+                        "jsonrpc": "2.0",
+                        "id": body.get("id"),
+                        "error": {
+                            "code": -32043,
+                            "message": "Approval receipt is unknown, expired, or already consumed",
+                        },
+                    },
+                )
+
+        forward_header_items = [
+            ("MCP-Protocol-Version", mcp_protocol_version),
+            ("Mcp-Method", mcp_method),
+            ("content-type", "application/json"),
+        ]
+        if mcp_name:
+            forward_header_items.append(("Mcp-Name", mcp_name))
+        forward_header_items.extend(custom_mcp_headers)
+        if UPSTREAM_BEARER_TOKEN:
+            forward_header_items.append(("authorization", f"Bearer {UPSTREAM_BEARER_TOKEN}"))
+        forward_headers = httpx.Headers(forward_header_items)
+
+        started = time.perf_counter()
+        with observability.stage("mcp.upstream.dispatch", kind=SpanKind.CLIENT) as upstream_span:
+            for header_name, header_value in observability.trace_context_headers().items():
+                forward_headers[header_name] = header_value
+            try:
+                async with httpx.AsyncClient(timeout=30.0, follow_redirects=False) as client:
+                    upstream = await client.post(
+                        UPSTREAM_MCP_URL,
+                        content=raw,
+                        headers=forward_headers,
+                    )
+            except Exception as exc:
+                observability.record_upstream(
+                    status_code=None,
+                    duration_seconds=time.perf_counter() - started,
+                    span=upstream_span,
+                )
+                upstream_span.set_attribute("error.type", type(exc).__name__)
+                request_span.set_attribute("firewall.outcome", "upstream_transport_error")
+                raise
+            observability.record_upstream(
+                status_code=upstream.status_code,
+                duration_seconds=time.perf_counter() - started,
+                span=upstream_span,
+            )
+        request_span.set_attribute(
+            "firewall.outcome",
+            _request_outcome_from_status(upstream.status_code),
         )
 
-    if approval_claims is not None and not audit.consume_approval(approval_claims):
-        return JSONResponse(
-            status_code=409,
-            content={
-                "jsonrpc": "2.0",
-                "id": body.get("id"),
-                "error": {
-                    "code": -32043,
-                    "message": "Approval receipt is unknown, expired, or already consumed",
-                },
-            },
+        response_headers = {}
+        if content_type := upstream.headers.get("content-type"):
+            response_headers["content-type"] = content_type
+        return Response(
+            content=upstream.content,
+            status_code=upstream.status_code,
+            headers=response_headers,
         )
-
-    forward_header_items = [
-        ("MCP-Protocol-Version", mcp_protocol_version),
-        ("Mcp-Method", mcp_method),
-        ("content-type", "application/json"),
-    ]
-    if mcp_name:
-        forward_header_items.append(("Mcp-Name", mcp_name))
-    forward_header_items.extend(custom_mcp_headers)
-    if UPSTREAM_BEARER_TOKEN:
-        forward_header_items.append(("authorization", f"Bearer {UPSTREAM_BEARER_TOKEN}"))
-    forward_headers = httpx.Headers(forward_header_items)
-
-    async with httpx.AsyncClient(timeout=30.0, follow_redirects=False) as client:
-        upstream = await client.post(UPSTREAM_MCP_URL, content=raw, headers=forward_headers)
-    response_headers = {}
-    if content_type := upstream.headers.get("content-type"):
-        response_headers["content-type"] = content_type
-    return Response(
-        content=upstream.content,
-        status_code=upstream.status_code,
-        headers=response_headers,
-    )
