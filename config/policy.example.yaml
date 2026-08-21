@@ -1,0 +1,66 @@
+version: "0.1"
+protocol_version: "2026-07-28"
+default_decision: deny
+
+allowed_methods:
+  - server/discover
+  - tools/list
+  - tools/call
+  - resources/list
+  - resources/read
+  - prompts/list
+  - prompts/get
+
+tools:
+  allow:
+    - search
+    - search_*
+    - read_*
+    - get_*
+    - list_*
+    - inspect_*
+  require_approval:
+    - send_*
+    - create_*
+    - update_*
+    - delete_*
+    - purchase_*
+    - transfer_*
+    - deploy_*
+  deny:
+    - shell
+    - exec
+    - execute_command
+    - run_command
+    - credential_*
+    - secret_*
+
+argument_constraints:
+  max_string_length: 5000
+  denied_keys:
+    - password
+    - passwd
+    - secret
+    - token
+    - api_key
+    - private_key
+  denied_path_patterns:
+    - /etc/*
+    - /root/.ssh/*
+    - /home/*/.ssh/*
+    - c:\\windows\\system32*
+  max_numeric:
+    amount: 1000
+
+injection_signals:
+  untrusted_fields:
+    - content
+    - text
+    - body
+    - description
+    - instructions
+  patterns:
+    - "ignore\\s+(all\\s+)?previous\\s+instructions"
+    - "reveal\\s+(the\\s+)?system\\s+prompt"
+    - "exfiltrat(e|ion)"
+    - "send\\s+.*(secret|token|password)"
