@@ -1,9 +1,8 @@
 from __future__ import annotations
 
 import os
-import time
-from contextlib import contextmanager
 from collections.abc import Iterator, Mapping
+from contextlib import contextmanager
 from typing import Any
 
 from opentelemetry import metrics, trace
@@ -146,24 +145,12 @@ class FirewallObservability:
         target = span or trace.get_current_span()
         target.set_attribute("firewall.approval.outcome", outcome)
 
-    @contextmanager
-    def upstream_span(self) -> Iterator[Span]:
-        started = time.perf_counter()
-        outcome = "error"
-        with self.tracer.start_as_current_span(
-            "mcp.upstream.dispatch",
-            kind=SpanKind.CLIENT,
-        ) as span:
-            try:
-                yield span
-                status_code = span.attributes.get("http.response.status_code")
-                if isinstance(status_code, int):
-                    outcome = status_family(status_code)
-            finally:
-                self.upstream_duration.record(
-                    max(0.0, time.perf_counter() - started),
-                    {"outcome": outcome},
-                )
+    def record_upstream(self, *, status_code: int | None, duration_seconds: float, span: Span) -> None:
+        outcome = status_family(status_code) if status_code is not None else "error"
+        self.upstream_duration.record(max(0.0, duration_seconds), {"outcome": outcome})
+        span.set_attribute("firewall.upstream.outcome", outcome)
+        if status_code is not None:
+            span.set_attribute("http.response.status_code", status_code)
 
 
 def configure_observability(*, service_version: str) -> FirewallObservability:
