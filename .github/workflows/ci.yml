@@ -19,4 +19,5 @@ jobs:
       - run: python scripts/run_benchmark.py --fail-on-unsafe
       - run: python scripts/run_approval_benchmark.py
       - run: python scripts/run_schema_benchmark.py
+      - run: python scripts/run_observability_benchmark.py
       - run: docker build -t mcp-agent-firewall:test .
