@@ -22,6 +22,7 @@ from app.approval import (
 from app.audit import AuditStore
 from app.models import Decision, EvaluationInput, McpEnvelope
 from app.observability import configure_observability, status_family
+from app.output_containment import OutputAction, OutputContainment
 from app.policy import PolicyConfig, PolicyEngine
 from app.rate_limit import SlidingWindowRateLimiter
 from app.tool_catalog import (
@@ -30,7 +31,7 @@ from app.tool_catalog import (
     decode_mcp_header_value,
 )
 
-SERVICE_VERSION = "0.4.0"
+SERVICE_VERSION = "0.5.0"
 ROOT = Path(__file__).resolve().parents[1]
 POLICY_PATH = os.getenv("POLICY_PATH", str(ROOT / "config" / "policy.example.yaml"))
 AUDIT_DB_PATH = os.getenv("AUDIT_DB_PATH", str(ROOT / "data" / "audit.db"))
@@ -43,6 +44,7 @@ AUDIT_READ_TOKEN = os.getenv("AUDIT_READ_TOKEN", "")
 UPSTREAM_BEARER_TOKEN = os.getenv("UPSTREAM_BEARER_TOKEN", "")
 MAX_REQUESTS_PER_MINUTE = int(os.getenv("MAX_REQUESTS_PER_MINUTE", "120"))
 MAX_BODY_BYTES = int(os.getenv("MAX_BODY_BYTES", "65536"))
+MAX_RESPONSE_BYTES = int(os.getenv("MAX_RESPONSE_BYTES", "262144"))
 
 DEFAULT_CATALOG_PATH = ROOT / "config" / "trusted_tools.example.json"
 DEFAULT_CATALOG_PIN_PATH = ROOT / "config" / "trusted_tools.example.sha256"
@@ -64,6 +66,7 @@ approval_receipts = ApprovalReceiptService(
     default_ttl_seconds=APPROVAL_DEFAULT_TTL_SECONDS,
     max_ttl_seconds=APPROVAL_MAX_TTL_SECONDS,
 )
+output_containment = OutputContainment(MAX_RESPONSE_BYTES)
 tool_catalog = TrustedToolCatalog.load(
     TRUSTED_TOOL_CATALOG_PATH,
     expected_sha256=TRUSTED_TOOL_CATALOG_SHA256,
@@ -177,6 +180,12 @@ def _request_outcome_from_status(status_code: int) -> str:
     }.get(family, "upstream_other")
 
 
+def _output_outcome(action: OutputAction, signals: tuple[str, ...]) -> str:
+    if action == OutputAction.BLOCK:
+        return "blocked"
+    return "flagged" if signals else "clean"
+
+
 @app.get("/health")
 def health() -> dict[str, Any]:
     return {
@@ -185,6 +194,8 @@ def health() -> dict[str, Any]:
         "approval_mode": "signed_receipts" if approval_receipts.configured else "disabled",
         "tool_catalog_version": tool_catalog.catalog_version,
         "tool_catalog_sha256": tool_catalog.digest,
+        "output_containment": "enabled",
+        "max_response_bytes": MAX_RESPONSE_BYTES,
         "telemetry_mode": observability.mode,
         "telemetry_exporting": observability.exporting,
     }
@@ -275,6 +286,16 @@ def recent_audit(
     if not AUDIT_READ_TOKEN or operator_token != AUDIT_READ_TOKEN:
         raise HTTPException(status_code=403, detail="audit_access_denied")
     return {"events": audit.recent(limit)}
+
+
+@app.get("/v1/audit/output")
+def recent_output_audit(
+    limit: int = 50,
+    operator_token: str | None = Header(default=None, alias="X-Operator-Token"),
+) -> dict[str, Any]:
+    if not AUDIT_READ_TOKEN or operator_token != AUDIT_READ_TOKEN:
+        raise HTTPException(status_code=403, detail="audit_access_denied")
+    return {"events": audit.recent_outputs(limit)}
 
 
 @app.post("/mcp")
@@ -506,13 +527,54 @@ async def proxy_mcp(
                 duration_seconds=time.perf_counter() - started,
                 span=upstream_span,
             )
+
+        content_type = upstream.headers.get("content-type")
+        with observability.stage("mcp.output.inspect") as output_span:
+            inspection = output_containment.inspect(upstream.content, content_type)
+            output_outcome = _output_outcome(inspection.action, inspection.signals)
+            observability.record_output(
+                outcome=output_outcome,
+                signals=inspection.signals,
+                span=output_span,
+            )
+        audit.append_output(
+            method=evaluation_input.mcp_method,
+            tool_name=evaluation_input.mcp_name,
+            outcome=output_outcome,
+            signals=inspection.signals,
+            content=upstream.content,
+        )
+
+        if inspection.action == OutputAction.BLOCK:
+            request_span.set_attribute("firewall.outcome", "output_blocked")
+            return JSONResponse(
+                status_code=502,
+                content={
+                    "jsonrpc": "2.0",
+                    "id": body.get("id"),
+                    "error": {
+                        "code": -32046,
+                        "message": "Upstream MCP response blocked by output containment",
+                        "data": inspection.public_data(),
+                    },
+                },
+                headers={
+                    "Mcp-Firewall-Untrusted-Content": "true",
+                    "Mcp-Firewall-Output-Inspection": "blocked",
+                },
+            )
+
         request_span.set_attribute(
             "firewall.outcome",
             _request_outcome_from_status(upstream.status_code),
         )
-
-        response_headers = {}
-        if content_type := upstream.headers.get("content-type"):
+        response_headers = {
+            "Mcp-Firewall-Untrusted-Content": "true",
+            "Mcp-Firewall-Output-Inspection": output_outcome,
+        }
+        if inspection.signals:
+            response_headers["Mcp-Firewall-Output-Signals"] = ",".join(inspection.signals)
+        if content_type:
             response_headers["content-type"] = content_type
         return Response(
             content=upstream.content,
