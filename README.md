@@ -1,26 +1,23 @@
 # MCP Agent Firewall
 
-A deterministic policy gateway for **Model Context Protocol (MCP) 2026-07-28** tool traffic.
+A deterministic security gateway for **Model Context Protocol (MCP) 2026-07-28** tool traffic.
 
-It sits between an agent/MCP client and a remote MCP server and decides whether a request is allowed, denied, or requires explicit human approval **before** the upstream tool executes.
+It sits between an AI agent/MCP client and an upstream MCP server and decides whether a request is **allowed**, **denied**, or requires **explicit human approval** before a real tool executes.
 
-The LLM never owns the policy decision.
+**The LLM never owns the security decision.**
 
-## Current milestone — v0.3.0
+## Current milestone — v0.4.0
 
-v0.3 adds a **SHA-256 pinned trusted tool catalog** and schema-aware validation to the signed-approval boundary introduced in v0.2.
-
-A policy allow/approval decision is now necessary but **not sufficient** to execute `tools/call`. The requested tool must also exist as an exact entry in the operator-pinned catalog, its arguments must satisfy the pinned JSON Schema 2020-12 contract, and any schema-declared `Mcp-Param-*` mirrors must agree with the JSON-RPC body.
-
-This blocks a broad policy pattern such as `read_*` from automatically authorizing a newly exposed or renamed upstream tool.
-
-## Safety model
+v0.4 adds **privacy-safe OpenTelemetry traces and low-cardinality security metrics** across the existing policy, trusted-schema, approval, and upstream execution path.
 
 ```text
 agent / MCP client
         |
         v
-MCP method/name integrity checks
+W3C trace context
+        |
+        v
+protocol integrity checks
         |
         v
 deterministic policy
@@ -31,130 +28,131 @@ deterministic policy
                    |
                    v
        pinned trusted tool catalog
-       + exact tool-name membership
-       + JSON Schema argument check
-       + Mcp-Param-* body/header check
+       + exact tool membership
+       + JSON Schema 2020-12
+       + Mcp-Param-* consistency
                    |
           +--------+--------+
           |                 |
-    signed approval       direct allow
-    when required            |
+   signed approval        direct allow
+   when required             |
           |                  |
-    exact request hash       |
-    expiry + policy ver      |
-    one-time consume         |
+   exact request hash        |
+   expiry + policy version   |
+   one-time consumption      |
           +--------+---------+
                    |
                    v
-               upstream MCP
+             upstream MCP
                    |
-                   v
-          privacy-minimized audit
+          +--------+--------+
+          |                 |
+     minimized audit   OpenTelemetry
+                       traces + metrics
 ```
 
-Prompt-injection detection remains intentionally **outside** the authorization decision. Injection-like content is recorded as a risk signal; permissions are determined by protocol integrity, deterministic policy, trusted tool contracts, argument constraints, and human approval where required.
+## Security controls
 
-## v0.3 trusted tool contracts
+### Deterministic authorization
 
-The example catalog lives at [`config/trusted_tools.example.json`](config/trusted_tools.example.json). The deployment pins the canonical catalog SHA-256 so a changed catalog cannot silently become trusted.
+- default-deny tool policy
+- exact `MCP-Protocol-Version`, `Mcp-Method`, and `Mcp-Name` consistency checks
+- explicit deny patterns for shell/command/credential-oriented tools
+- explicit approval classes for consequential send/create/update/delete/purchase/transfer/deploy tools
+- nested argument checks for secret-bearing keys, protected paths, oversized strings, and numeric limits
+- prompt-injection-like content is only a **risk signal**, never the authorization primitive
+
+### Pinned trusted tool contracts
+
+Every `tools/call` must also exist in an operator-pinned tool catalog.
+
+- canonical catalog SHA-256 pin
+- JSON Schema **2020-12** argument validation
+- policy wildcards cannot make an unpinned tool trusted
+- duplicate catalog keys rejected
+- external `$ref` / `$dynamicRef` targets rejected
+- schema depth/node/tool counts bounded
+- `x-mcp-header` annotations restricted to statically reachable primitive properties
+- missing, duplicated, malformed, unexpected, or body-mismatched `Mcp-Param-*` headers fail closed
+- Base64 sentinel values are decoded before comparison
+
+### Signed human approvals
+
+Consequential actions use HMAC-SHA256 approval receipts bound to:
+
+- canonical SHA-256 of the exact MCP request
+- tool and method
+- MCP protocol version
+- current firewall policy version
+- approver identity
+- issue/expiry time
+- unique one-time `jti`
+
+Receipts are atomically consumed before upstream dispatch. Modified, expired, replayed, forged, unregistered, or policy-stale receipts are rejected.
+
+## v0.4 OpenTelemetry observability
+
+Telemetry is optional and exports over **OTLP/HTTP** when enabled.
+
+The firewall records:
+
+- end-to-end MCP request spans
+- deterministic policy decisions
+- security rejection stage and bounded outcome
+- upstream status and latency
+- policy and trusted-catalog versions
+- W3C `traceparent` parent context
+
+Metrics:
+
+- `mcp.firewall.requests`
+- `mcp.firewall.request.duration`
+- `mcp.firewall.policy.decisions`
+- `mcp.firewall.security.rejects`
+- `mcp.firewall.upstream.duration`
+
+### Privacy and cardinality rules
+
+Arbitrary attacker-controlled values are **not** metric labels.
+
+Metric dimensions use bounded values such as:
+
+- known MCP method or `unknown`
+- tool class: `read`, `write`, `dangerous`, `other`, `none`
+- bounded policy decision
+- bounded rejection stage
+- bounded request outcome
+- HTTP status class
+
+The telemetry layer does **not** put raw arguments, request bodies, request IDs, client names, filesystem paths, arbitrary error messages, secrets, or arbitrary tool names into metric labels.
+
+A bounded tool name may appear on a trace for debugging, but raw tool arguments are never attached to spans.
+
+Only standard W3C `traceparent` is extracted for parent context. Caller baggage is intentionally not accepted.
+
+OpenTelemetry HTTP conventions recommend bounded attributes and explicitly warn that attacker-controlled values can create metric-cardinality problems; v0.4 applies that principle to the MCP-specific security metrics.
+
+## Configuration
 
 ```env
+POLICY_PATH=./config/policy.example.yaml
+AUDIT_DB_PATH=./data/audit.db
+UPSTREAM_MCP_URL=https://your-mcp-server.example/mcp
+
 TRUSTED_TOOL_CATALOG_PATH=./config/trusted_tools.example.json
-TRUSTED_TOOL_CATALOG_SHA256=d6c3586e2d14d581089bf470df99ef6948abbef81de36c97b5c1637ff93098ac
+TRUSTED_TOOL_CATALOG_SHA256=<canonical-catalog-sha256>
+
+APPROVAL_SIGNING_KEY=<random-secret-at-least-32-bytes>
+APPROVAL_ISSUER_TOKEN=<operator-only-token>
+APPROVAL_DEFAULT_TTL_SECONDS=300
+APPROVAL_MAX_TTL_SECONDS=900
+
+OTEL_ENABLED=true
+OTEL_SERVICE_NAME=mcp-agent-firewall
+OTEL_EXPORTER_OTLP_ENDPOINT=http://localhost:4318
 ```
 
-The committed example catalog has a matching pin in [`config/trusted_tools.example.sha256`](config/trusted_tools.example.sha256). When a custom catalog path is configured, an explicit `TRUSTED_TOOL_CATALOG_SHA256` is required; startup fails closed without a valid pin.
-
-### Schema controls
-
-- JSON Schema **2020-12** validation before approval issuance and again before dispatch
-- exact trusted catalog membership for every `tools/call`
-- duplicate JSON keys rejected while loading the catalog
-- external `$ref` / `$dynamicRef` targets rejected; only local `#...` references are accepted
-- schema depth, node count, and catalog tool count bounded
-- root input schema must be an object
-- policy wildcards cannot make an unpinned tool trusted
-- schema validation errors expose the failing path/validator, not the raw argument value
-
-### `Mcp-Param-*` integrity
-
-The firewall implements the MCP 2026-07-28 `x-mcp-header` contract for primitive mirrored parameters:
-
-- `x-mcp-header` is accepted only for statically reachable `properties`
-- supported mirrored types are `string`, `integer`, and `boolean`
-- header names must be valid HTTP tokens and unique case-insensitively
-- required body values must have exactly one matching `Mcp-Param-{Name}` header
-- missing, duplicate, malformed, unexpected, or body-mismatched mirrors fail closed
-- Base64 sentinel values (`=?base64?...?=`) are decoded as UTF-8 before comparison
-- integer mirrors are compared numerically
-- validated `Mcp-Param-*` headers, including unrecognized ones, are preserved when proxying upstream
-
-Example trusted schema fragment:
-
-```json
-{
-  "name": "read_metrics",
-  "inputSchema": {
-    "type": "object",
-    "properties": {
-      "region": {"type": "string", "x-mcp-header": "Region"},
-      "window_minutes": {"type": "integer", "minimum": 1, "maximum": 1440}
-    },
-    "required": ["region"],
-    "additionalProperties": false
-  }
-}
-```
-
-A valid call therefore carries the same value in both places:
-
-```text
-Mcp-Name: read_metrics
-Mcp-Param-Region: us-west1
-```
-
-```json
-{"name":"read_metrics","arguments":{"region":"us-west1","window_minutes":15}}
-```
-
-If the header says `eu-west1` while the body says `us-west1`, the firewall rejects the request before upstream execution.
-
-## Signed human approvals
-
-v0.2 introduced HMAC-SHA256, expiring, one-time approval receipts. v0.3 retains that design and requires the request to pass the pinned tool schema before a receipt can be issued.
-
-Each receipt remains bound to:
-
-- canonical SHA-256 of protocol version + MCP method + MCP name + JSON-RPC body
-- tool name
-- MCP method and protocol version
-- current firewall policy version
-- human approver identity
-- issue and expiry timestamps
-- a unique receipt ID (`jti`)
-
-Changing the request or policy version invalidates the receipt. A valid receipt is atomically consumed immediately before upstream dispatch and cannot be replayed.
-
-## Core controls
-
-- validates `MCP-Protocol-Version`, `Mcp-Method`, and `Mcp-Name` against the gateway request model/body
-- default-deny deterministic tool policy
-- explicit deny patterns for shell/command/credential-style tools
-- human-approval class for consequential send/create/update/delete/purchase/transfer/deploy tools
-- nested argument scanning for secret-bearing keys, protected paths, oversized strings, and numeric limits
-- prompt-injection signals without treating regex as a security authority
-- pinned trusted tool catalog + JSON Schema argument validation
-- `Mcp-Param-*` validation from trusted `x-mcp-header` annotations
-- HMAC-SHA256 approval receipts with minimum 32-byte signing key
-- short approval TTL with a hard one-hour maximum
-- policy-version-bound approvals and atomic one-time consumption
-- privacy-minimized SQLite audit log storing request fingerprints instead of raw tool arguments
-- operator-protected approval issuance and audit reads
-- caller authorization is never forwarded upstream
-- single-process per-client rate limiting
-- optional upstream MCP reverse proxy only after all applicable checks pass
-- three independent security regression gates in CI
-- Docker + GitHub Actions
+If `OTEL_ENABLED=true`, an explicit OTLP endpoint is required. With telemetry disabled, the firewall runs without an exporter.
 
 ## Run
 
@@ -164,49 +162,46 @@ pytest -q
 python scripts/run_benchmark.py --fail-on-unsafe
 python scripts/run_approval_benchmark.py
 python scripts/run_schema_benchmark.py
+python scripts/run_telemetry_benchmark.py
 uvicorn app.main:app --reload
 ```
 
-## Configure
+Docker:
 
-```env
-UPSTREAM_MCP_URL=https://your-mcp-server.example/mcp
-APPROVAL_SIGNING_KEY=<random-secret-at-least-32-bytes>
-APPROVAL_ISSUER_TOKEN=<operator-only-token>
-APPROVAL_DEFAULT_TTL_SECONDS=300
-APPROVAL_MAX_TTL_SECONDS=900
-TRUSTED_TOOL_CATALOG_PATH=./config/trusted_tools.example.json
-TRUSTED_TOOL_CATALOG_SHA256=<canonical-catalog-sha256>
+```bash
+docker build -t mcp-agent-firewall .
+docker run --rm -p 8000:8000 --env-file .env mcp-agent-firewall
 ```
 
-The signing key stays inside the firewall. Operators authenticate to the receipt-issuance endpoint using `X-Operator-Token`; callers never receive the signing key.
+## Verified v0.4 regression evidence
 
-## Verified v0.3 regression evidence
+Verified on GitHub Actions for the v0.4 implementation:
 
-Verified on GitHub Actions for the v0.3 implementation:
-
-- **47 pytest tests passed**
+- **66 pytest tests passed**
 - policy safety benchmark: **32/32 exact decisions**
-- policy safety benchmark: **0 unsafe false accepts, 0 false blocks**
-- signed approval security benchmark: **11/11 passed**
-- signed approval security benchmark: **0 unsafe false accepts**
-- trusted schema / MCP header benchmark: **12/12 passed**
-- trusted schema / MCP header benchmark: **0 unsafe false accepts, 0 false blocks**
+- policy benchmark: **0 unsafe false accepts, 0 false blocks**
+- signed approval benchmark: **11/11 passed**
+- approval benchmark: **0 unsafe false accepts**
+- trusted schema / MCP-header benchmark: **12/12 passed**
+- schema/header benchmark: **0 unsafe false accepts, 0 false blocks**
+- telemetry privacy/cardinality benchmark: **10/10 passed**
+- telemetry benchmark: **0 unsafe false accepts**
 - Ruff: **passed**
 - Docker build: **passed**
 
-The schema/header benchmark covers valid mirrors, missing mirrors, header/body mismatches, extra arguments, unpinned tools, nested bindings, Base64 Unicode values, malformed Base64, catalog-pin tampering, external schema references, unsupported mirrored numeric types, and non-static header annotations.
+These are synthetic regression results, not a claim of universal production security or production-scale observability.
 
-These are synthetic regression results, not a claim of universal production security.
+## Portfolio story
 
-See [`docs/THREAT_MODEL.md`](docs/THREAT_MODEL.md) for trust boundaries and residual risk.
+This project demonstrates that production AI-agent engineering is not only about model quality. An agent connected to real tools also needs deterministic authorization, protocol integrity, contract validation, human approval for consequential actions, replay resistance, privacy-aware auditability, and observable failure boundaries.
 
-## Next milestones
+## Residual risks / next milestones
 
-1. OpenTelemetry traces and low-cardinality policy-decision metrics
-2. approval signing-key rotation with key IDs and bounded overlap
-3. response-side DLP / untrusted-content labeling
-4. shared replay and rate-limit state for multi-replica deployment
-5. optional OPA/Rego backend with deterministic local fallback
-6. adversarial corpus derived from real MCP traces
-7. broader protocol metadata consistency checks beyond the v0.3 `tools/call` contract
+- approval signing-key rotation with key IDs and bounded overlap
+- response-side DLP and explicit untrusted-output labeling
+- distributed replay/rate-limit state for multi-replica deployments
+- optional OPA/Rego policy backend with deterministic local fallback
+- live upstream `tools/list` drift reconciliation against the pinned catalog
+- adversarial corpus derived from real MCP traces
+
+See [`docs/THREAT_MODEL.md`](docs/THREAT_MODEL.md) for the security model.
