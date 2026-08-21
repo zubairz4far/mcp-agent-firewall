@@ -10,7 +10,10 @@ os.environ.setdefault("AUDIT_DB_PATH", "/tmp/mcp-agent-firewall-otel-benchmark.d
 os.environ.setdefault("POLICY_PATH", str(ROOT / "config" / "policy.example.yaml"))
 os.environ.setdefault("APPROVAL_SIGNING_KEY", "benchmark-signing-key-32-bytes-min!!")
 os.environ.setdefault("APPROVAL_ISSUER_TOKEN", "benchmark-issuer-token")
-os.environ.setdefault("TRUSTED_TOOL_CATALOG_PATH", str(ROOT / "config" / "trusted_tools.example.json"))
+os.environ.setdefault(
+    "TRUSTED_TOOL_CATALOG_PATH",
+    str(ROOT / "config" / "trusted_tools.example.json"),
+)
 os.environ.setdefault(
     "TRUSTED_TOOL_CATALOG_SHA256",
     (ROOT / "config" / "trusted_tools.example.sha256").read_text().strip(),
@@ -73,7 +76,12 @@ def build_observability() -> tuple[FirewallObservability, CaptureSpanExporter, C
     provider = TracerProvider()
     provider.add_span_processor(SimpleSpanProcessor(exporter))
     meter = CaptureMeter()
-    return FirewallObservability(provider.get_tracer("benchmark"), meter, mode="test"), exporter, meter
+    observability = FirewallObservability(
+        provider.get_tracer("benchmark"),
+        meter,
+        mode="test",
+    )
+    return observability, exporter, meter
 
 
 def headers(tool: str) -> dict[str, str]:
@@ -184,16 +192,21 @@ def main() -> int:
         )
         upstream_metric = meter.instruments["mcp.firewall.upstream.duration"].measurements
 
+        approval_stage_ok = (
+            approval_response.status_code == 428 and "mcp.approval.verify" in span_names
+        )
+        upstream_span_ok = upstream_span is not None and upstream_span.kind == SpanKind.CLIENT
+
         cases = [
             ("search_request_reached_no_upstream_gate", search_response.status_code == 503),
             ("secret_sentinel_absent_from_telemetry", sentinel not in telemetry_text),
             ("w3c_parent_context_preserved", parent_preserved),
             ("policy_stage_emitted", "mcp.policy.evaluate" in span_names),
             ("schema_stage_emitted", "mcp.schema.validate" in span_names),
-            ("approval_stage_emitted", approval_response.status_code == 428 and "mcp.approval.verify" in span_names),
+            ("approval_stage_emitted", approval_stage_ok),
             ("metric_dimensions_bounded", dimensions_bounded),
             ("upstream_request_succeeds", upstream_response.status_code == 200),
-            ("upstream_span_is_client", upstream_span is not None and upstream_span.kind == SpanKind.CLIENT),
+            ("upstream_span_is_client", upstream_span_ok),
             (
                 "upstream_trace_context_injected",
                 captured_upstream_headers.get("traceparent", "").startswith(
