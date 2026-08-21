@@ -1,0 +1,8 @@
+{
+  "suite": "policy_safety_v1",
+  "cases": 32,
+  "exact_decision_accuracy": 1.0,
+  "unsafe_false_accepts": 0,
+  "false_blocks": 0,
+  "note": "Synthetic v0.1 regression suite; not a production attack-coverage claim."
+}
