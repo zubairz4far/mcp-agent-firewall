@@ -6,10 +6,11 @@ import hashlib
 import hmac
 import json
 import re
+from collections.abc import Iterable
 from dataclasses import dataclass
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
-from typing import Any, Iterable
+from typing import Any
 
 from jsonschema import Draft202012Validator
 from jsonschema.exceptions import SchemaError
@@ -88,9 +89,10 @@ def _validate_schema_safety(schema: dict[str, Any]) -> None:
             raise ToolCatalogError("trusted_schema_too_deep")
         if isinstance(value, dict):
             for key, child in value.items():
-                if key in {"$ref", "$dynamicRef"}:
-                    if not isinstance(child, str) or not child.startswith("#"):
-                        raise ToolCatalogError("trusted_schema_external_ref_forbidden")
+                if key in {"$ref", "$dynamicRef"} and (
+                    not isinstance(child, str) or not child.startswith("#")
+                ):
+                    raise ToolCatalogError("trusted_schema_external_ref_forbidden")
                 walk(child, depth + 1)
         elif isinstance(value, list):
             for child in value:
@@ -294,7 +296,10 @@ class TrustedToolCatalog:
             name = raw_name.decode("latin-1")
             if not name.lower().startswith("mcp-param-"):
                 continue
-            if len(custom_headers) >= MAX_MCP_PARAM_HEADERS or len(raw_value) > MAX_MCP_PARAM_VALUE_BYTES:
+            if (
+                len(custom_headers) >= MAX_MCP_PARAM_HEADERS
+                or len(raw_value) > MAX_MCP_PARAM_VALUE_BYTES
+            ):
                 raise ToolCatalogError("mcp_param_headers_too_large")
             value = raw_value.decode("latin-1")
             custom_headers.append((name, value))
