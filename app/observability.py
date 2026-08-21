@@ -83,6 +83,11 @@ class FirewallObservability:
     def extract_parent(self, headers: Mapping[str, str]) -> Context:
         return TraceContextTextMapPropagator().extract(carrier=headers)
 
+    def trace_context_headers(self) -> dict[str, str]:
+        carrier: dict[str, str] = {}
+        TraceContextTextMapPropagator().inject(carrier=carrier)
+        return carrier
+
     @contextmanager
     def request_span(
         self,
