@@ -9,16 +9,19 @@ os.environ.setdefault("APPROVAL_SIGNING_KEY", "test-signing-key-32-bytes-minimum
 os.environ.setdefault("APPROVAL_ISSUER_TOKEN", "test-issuer-token")
 os.environ.setdefault("APPROVAL_DEFAULT_TTL_SECONDS", "60")
 os.environ.setdefault("APPROVAL_MAX_TTL_SECONDS", "300")
-os.environ.setdefault("TRUSTED_TOOL_CATALOG_PATH", str(ROOT / "config" / "trusted_tools.example.json"))
+os.environ.setdefault(
+    "TRUSTED_TOOL_CATALOG_PATH",
+    str(ROOT / "config" / "trusted_tools.example.json"),
+)
 os.environ.setdefault(
     "TRUSTED_TOOL_CATALOG_SHA256",
     (ROOT / "config" / "trusted_tools.example.sha256").read_text().strip(),
 )
 
-from fastapi.testclient import TestClient
+from fastapi.testclient import TestClient  # noqa: E402
 
-from app import main as main_module
-from app.main import app
+from app import main as main_module  # noqa: E402
+from app.main import app  # noqa: E402
 
 client = TestClient(app)
 
