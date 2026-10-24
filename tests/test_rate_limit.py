@@ -37,6 +37,10 @@ def test_expired_buckets_reclaimed_before_capacity_denial(monkeypatch):
 
 
 def test_rejects_invalid_configuration():
-    for kwargs in ({"max_requests": 0}, {"max_requests": 1, "window_seconds": 0}, {"max_requests": 1, "max_keys": 0}):
+    for kwargs in (
+        {"max_requests": 0},
+        {"max_requests": 1, "window_seconds": 0},
+        {"max_requests": 1, "max_keys": 0},
+    ):
         with pytest.raises(ValueError, match="positive"):
             SlidingWindowRateLimiter(**kwargs)
