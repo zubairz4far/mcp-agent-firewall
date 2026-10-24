@@ -76,7 +76,8 @@ MAX_JSON_NODES = 10_000
 
 
 def _normalized_key(key: str) -> str:
-    return re.sub(r"[^a-z0-9]+", "_", key.lower()).strip("_")
+    camel_case = re.sub(r"(?<=[a-z0-9])(?=[A-Z])", "_", key)
+    return re.sub(r"[^a-z0-9]+", "_", camel_case.lower()).strip("_")
 
 
 def _has_value(value: Any) -> bool:
@@ -124,6 +125,20 @@ def _walk_json(value: Any) -> tuple[set[str], bool]:
     return signals, True
 
 
+def _reject_duplicate_keys(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+    """Reject ambiguous JSON objects before any upstream value is trusted."""
+    value: dict[str, Any] = {}
+    for key, child in pairs:
+        if key in value:
+            raise ValueError("Duplicate JSON object key")
+        value[key] = child
+    return value
+
+
+def _reject_nonfinite(value: str) -> None:
+    raise ValueError(f"Non-finite JSON constant: {value}")
+
+
 class OutputContainment:
     def __init__(self, max_response_bytes: int = 262_144):
         if max_response_bytes < 1:
@@ -152,29 +167,30 @@ class OutputContainment:
 
         signals = _text_signals(text)
         media_type = (content_type or "").split(";", 1)[0].strip().lower()
-        declared_json = media_type.endswith("/json") or media_type.endswith("+json")
         stripped = text.lstrip()
         looks_json = declared_json or stripped.startswith("{") or stripped.startswith("[")
 
         if looks_json:
             try:
-                parsed = json.loads(text)
-            except json.JSONDecodeError:
-                if declared_json:
-                    return OutputInspection(
-                        action=OutputAction.BLOCK,
-                        signals=("invalid_json_response",),
-                        inspected_bytes=size,
-                    )
-            else:
+                parsed = json.loads(
+                    text,
+                    object_pairs_hook=_reject_duplicate_keys,
+                    parse_constant=_reject_nonfinite,
+                )
                 json_signals, complete = _walk_json(parsed)
-                signals.update(json_signals)
-                if not complete:
-                    return OutputInspection(
-                        action=OutputAction.BLOCK,
-                        signals=tuple(sorted(signals)),
-                        inspected_bytes=size,
-                    )
+            except (ValueError, RecursionError):
+                return OutputInspection(
+                    action=OutputAction.BLOCK,
+                    signals=("invalid_json_response",),
+                    inspected_bytes=size,
+                )
+            signals.update(json_signals)
+            if not complete:
+                return OutputInspection(
+                    action=OutputAction.BLOCK,
+                    signals=tuple(sorted(signals)),
+                    inspected_bytes=size,
+                )
 
         blocking_signals = signals - {"prompt_injection_signal"}
         action = OutputAction.BLOCK if blocking_signals else OutputAction.ALLOW
