@@ -89,3 +89,39 @@ def test_plain_text_injection_is_flagged():
     )
     assert result.action == OutputAction.ALLOW
     assert result.signals == ("prompt_injection_signal",)
+
+
+def test_duplicate_json_keys_cannot_hide_a_secret_from_inspection():
+    payload = b'{"result": {"api_key": "secret-in-first-field", "api_key": ""}}'
+    result = OutputContainment().inspect(payload, "application/json")
+    assert result.action == OutputAction.BLOCK
+    assert "invalid_json_response" in result.signals
+
+
+def test_duplicate_json_keys_rejected_when_response_is_not_labeled_json():
+    result = OutputContainment().inspect(b'{"status": "ok", "status": "deny"}', "text/plain")
+    assert result.action == OutputAction.BLOCK
+    assert "invalid_json_response" in result.signals
+
+
+def test_camel_case_secret_keys_blocked():
+    for key in ("accessToken", "refreshToken", "apiKey", "clientSecret", "privateKey"):
+        result = inspect_json({"result": {key: "nonempty-value"}})
+        assert result.action == OutputAction.BLOCK, key
+        assert "sensitive_key" in result.signals
+
+
+def test_nonfinite_json_is_rejected():
+    for payload in (b'{"score": NaN}', b'{"score": Infinity}'):
+        result = OutputContainment().inspect(payload, "application/json")
+        assert result.action == OutputAction.BLOCK
+        assert "invalid_json_response" in result.signals
+
+
+def test_excessively_nested_json_fails_closed_without_crashing():
+    result = OutputContainment(max_response_bytes=100_000).inspect(
+        (b"[" * 1800) + b"0" + (b"]" * 1800),
+        "application/json",
+    )
+    assert result.action == OutputAction.BLOCK
+    assert result.signals == ("invalid_json_response",)
