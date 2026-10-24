@@ -168,6 +168,7 @@ class OutputContainment:
         signals = _text_signals(text)
         media_type = (content_type or "").split(";", 1)[0].strip().lower()
         stripped = text.lstrip()
+        declared_json = media_type.endswith("/json") or media_type.endswith("+json")
         looks_json = declared_json or stripped.startswith("{") or stripped.startswith("[")
 
         if looks_json:
